@@ -26,6 +26,10 @@ jobs:
         run: |
           git config --global url."https://x-access-token:${{ secrets.PYCK_WIDE_REPO_ACCESS_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
+      # goreleaser's sboms: block shells out to syft, which is not preinstalled
+      # on the runner. Without this the release fails at the cataloging step.
+      - uses: anchore/sbom-action/download-syft@v0
+
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"

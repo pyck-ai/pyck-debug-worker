@@ -7,6 +7,10 @@ on:
   workflow_dispatch:
 
 permissions:
+  # contents: read is required for actions/checkout. Declaring any permissions
+  # block sets every unlisted scope to none, so omitting it makes checkout fail
+  # with "Repository not found" on a private repo.
+  contents: read
   packages: write
 
 jobs:
