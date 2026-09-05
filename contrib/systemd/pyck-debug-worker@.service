@@ -1,0 +1,58 @@
+# Example systemd unit for RHEL-family systems (RHEL/CentOS/Rocky/Alma 8+,
+# systemd >= 239). Templated on the environment: the instance name after the
+# @ becomes --env, so multiple environments can run side by side.
+#
+# Install:
+#   sudo install -m 0755 pyck-debug-worker /usr/local/bin/pyck-debug-worker
+#   sudo install -m 0644 pyck-debug-worker@.service /etc/systemd/system/
+#   sudo install -m 0600 pyck-debug-worker.sysconfig.example /etc/sysconfig/pyck-debug-worker
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pyck-debug-worker@test.service
+#
+# Logs:
+#   journalctl -u pyck-debug-worker@test -f
+#
+# Credentials are optional (see README) — the EnvironmentFile below is marked
+# optional with the leading '-' so connectivity-only probing needs no setup.
+
+[Unit]
+Description=pyck-debug-worker (%i)
+Documentation=https://github.com/pyck-ai/pyck-debug-worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pyck-debug-worker --env %i
+Restart=on-failure
+RestartSec=5s
+
+# RHEL convention (Debian uses /etc/default instead). Optional: absent
+# credentials simply gate off the auth/tenant/temporal stages.
+EnvironmentFile=-/etc/sysconfig/pyck-debug-worker
+
+# The binary never writes to disk and needs only outbound network, so it can
+# run fully sandboxed under an ephemeral, unprivileged user.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pyck-debug-worker
+
+[Install]
+WantedBy=multi-user.target

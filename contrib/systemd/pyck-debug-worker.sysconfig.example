@@ -1,0 +1,26 @@
+# Example EnvironmentFile for contrib/systemd/pyck-debug-worker@.service.
+#
+# RHEL convention: /etc/sysconfig/pyck-debug-worker (Debian uses /etc/default
+# instead). Install at that path, mode 0600, owned by root:
+#
+#   sudo install -m 0600 pyck-debug-worker.sysconfig.example \
+#     /etc/sysconfig/pyck-debug-worker
+#
+# All variables are optional — absent credentials simply gate off the
+# temporal/namespace/longpoll and auth/tenant stages (see README). Never put
+# a credential on the command line; the binary itself refuses that.
+
+# One of these three selects the pyck service/user token (first match wins).
+#PYCK_API_TOKEN=
+#PYCK_SERVICE_TOKEN=
+#PYCK_AUTH=
+
+# Enables the temporal/namespace stages (+ longpoll, always on by default).
+#TEMPORAL_API_KEY=
+
+# Cross-checked against the resolved tenant id; a mismatch is a FAIL.
+#PYCK_API_TENANT_ID=
+#TEMPORAL_NAMESPACE=
+
+# Overrides the GraphQL gateway used for the auth/tenant stages.
+#PYCK_GATEWAY_URL=

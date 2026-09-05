@@ -24,11 +24,14 @@ task build
 ```sh
 pyck-debug-worker --env test
 pyck-debug-worker --env prod --env dev
-pyck-debug-worker --target 127.0.0.1:7233=grpc --insecure --namespace default --deep
 ```
 
 `--env` resolves both the Temporal frontend and the app domain. Note `prod` is
 `eu.pyck.cloud`, and `feature/<branch>` uses a `-` separator.
+
+That is the entire surface: `--env` and `--version`, plus `--token-file` for
+credentials (see below). Everything else — interval, task queue, deep long-poll,
+CA trust — is a fixed, safe default. Nothing to misconfigure.
 
 ## Credentials are optional, and gate what runs
 
@@ -70,16 +73,28 @@ an `OVERALL`; SIGINT/SIGTERM prints a run summary.
 | flag | |
 |---|---|
 | `--env` | environment to probe, repeatable |
-| `--target` | explicit `host:port[=grpc\|https]`, repeatable |
-| `--interval` | cycle interval, default `30s` |
-| `--namespace` | Temporal namespace |
-| `--insecure` | plaintext, no credentials (in-cluster `:7236`) |
-| `--deep` | enable the long-poll stage |
-| `--task-queue` | default `pyck-debug-worker-probe` |
-| `--ca-bundle` | PEM CA bundle |
-| `--token-file` | file holding a credential |
-| `--debug-dns` | capture the Go resolver's decision trace |
-| `--version` | |
+| `--token-file` | file holding a credential (alternative to the env vars above) |
+| `--version` | print version and exit |
+
+## Run as a service (RHEL / systemd)
+
+Example templated unit + `EnvironmentFile`:
+[`contrib/systemd/pyck-debug-worker@.service`](contrib/systemd/pyck-debug-worker@.service),
+[`contrib/systemd/pyck-debug-worker.sysconfig.example`](contrib/systemd/pyck-debug-worker.sysconfig.example).
+
+```sh
+sudo install -m 0755 pyck-debug-worker /usr/local/bin/pyck-debug-worker
+sudo install -m 0644 contrib/systemd/pyck-debug-worker@.service /etc/systemd/system/
+sudo install -m 0600 contrib/systemd/pyck-debug-worker.sysconfig.example /etc/sysconfig/pyck-debug-worker
+sudo systemctl daemon-reload
+sudo systemctl enable --now pyck-debug-worker@test.service
+journalctl -u pyck-debug-worker@test -f
+```
+
+The instance name after `@` becomes `--env`, so `pyck-debug-worker@prod.service`
+and `pyck-debug-worker@dev.service` run side by side. The unit runs under
+`DynamicUser` with no filesystem writes and no capabilities — matching the
+env-only, read-only design above.
 
 ## Exit codes
 
