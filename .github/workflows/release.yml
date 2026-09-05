@@ -38,6 +38,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.PYCK_WIDE_REPO_ACCESS_TOKEN }}
           GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
 
+      # Build provenance attestation requires a paid plan for private repos
+      # ("Feature not available for the pyck-ai organization"). Skipped while
+      # private; runs automatically if this repo is ever made public.
       - uses: actions/attest@v4
+        if: ${{ !github.event.repository.private }}
         with:
           subject-checksums: ./dist/checksums.txt

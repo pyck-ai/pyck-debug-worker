@@ -334,10 +334,23 @@ goreleaser v2, `linux/darwin/windows × amd64/arm64`, tar.gz plus zip on Windows
 `ghcr.io/pyck-ai/pyck-debug-worker`. CI runs vet/test/lint/build plus `govulncheck`.
 
 Supply chain, ~20 lines of YAML and 0 binary bytes: goreleaser native `sboms:`
-plus `actions/attest@v4` with `subject-checksums: ./dist/checksums.txt` — one step
-attests all six artifacts, SLSA Build L3 on GitHub-hosted runners. Cosign keyless
-signing is rejected: it duplicates the GitHub attestation and publishes repo
-identity to the public Rekor log.
+(requires `anchore/sbom-action/download-syft` on the runner — syft is not
+preinstalled) plus `actions/attest@v4` with `subject-checksums: ./dist/checksums.txt`
+— one step attests all six artifacts, SLSA Build L3 on GitHub-hosted runners.
+Cosign keyless signing is rejected: it duplicates the GitHub attestation and
+publishes repo identity to the public Rekor log.
+
+**Verified 2026-09-05:** build provenance attestation is **not available for
+private repos on the pyck-ai plan** (`Failed to persist attestation: Feature not
+available for the pyck-ai organization`). The step is gated on
+`!github.event.repository.private` so releases stay green; it starts working by
+itself if the repo is made public or the plan is upgraded. SBOMs are unaffected.
+
+Releases are **immutable** in this org: a published release cannot receive
+assets afterwards. `v1.0.0` was published empty and can never be populated —
+retag rather than retry. Workflow `permissions:` blocks are all-or-nothing; a
+block that omits `contents: read` breaks `actions/checkout` on a private repo
+with a misleading `Repository not found`.
 
 macOS caveat to print as a startup banner on darwin: `CGO_ENABLED=0` forces the
 pure-Go resolver, so split-horizon DNS, VPN resolvers and `.local`/mDNS will not
