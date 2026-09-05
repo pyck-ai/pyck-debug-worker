@@ -1,0 +1,50 @@
+version: '3'
+
+tasks:
+  build:
+    desc: Build the pyck-debug-worker binary
+    cmds:
+      - go build -o bin/pyck-debug-worker ./cmd/pyck-debug-worker
+    sources:
+      - ./**/*.go
+      - go.mod
+    generates:
+      - bin/pyck-debug-worker
+
+  install:
+    desc: Install pyck-debug-worker to $GOPATH/bin
+    cmds:
+      - go install ./cmd/pyck-debug-worker
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test ./... -count=1 -timeout 120s
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  tidy:
+    desc: Run go mod tidy
+    cmds:
+      - go mod tidy
+
+  lint:
+    desc: Run golangci-lint
+    cmds:
+      - golangci-lint run
+
+  check:
+    desc: Run all checks (vet + test + lint) — same as pre-commit
+    cmds:
+      - task: vet
+      - task: test
+      - task: lint
+
+  default:
+    desc: Build and run checks
+    cmds:
+      - task: build
+      - task: check

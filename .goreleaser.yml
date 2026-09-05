@@ -1,0 +1,52 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: pyck-debug-worker
+    main: ./cmd/pyck-debug-worker
+    binary: pyck-debug-worker
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    tags:
+      - netgo
+      - osusergo
+    ldflags:
+      - -s -w -X github.com/pyck-ai/pyck-debug-worker/internal/buildinfo.version={{.Version}} -X github.com/pyck-ai/pyck-debug-worker/internal/buildinfo.commit={{.Commit}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: pyck-debug-worker
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: pyck-debug-worker_{{.Version}}_{{.Os}}_{{.Arch}}
+
+checksum:
+  name_template: checksums.txt
+
+sboms:
+  - id: archive
+    artifacts: archive
+
+release:
+  prerelease: auto
+
+changelog:
+  filters:
+    exclude:
+      - "^docs:"
+      - "^ci:"
+      - "^chore:"
+      - "^Merge "

@@ -1,0 +1,9 @@
+.git
+.github
+dist
+*.md
+.golangci.toml
+.goreleaser.yml
+Dockerfile
+.dockerignore
+Taskfile.yml

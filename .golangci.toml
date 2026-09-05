@@ -1,0 +1,72 @@
+version = "2"
+
+[run]
+timeout = "5m"
+issues-exit-code = 1
+tests = true
+modules-download-mode = "readonly"
+
+[output]
+show-stats = true
+sort-order = [ "linter", "file", "severity" ]
+
+[issues]
+uniq-by-line = true
+
+[formatters]
+enable = [
+    "gofumpt",
+    "gci"
+]
+exclusions.generated = "strict"
+
+[formatters.settings.gci]
+sections = [
+    "standard",
+    "default",
+    "blank",
+    "prefix(github.com/pyck-ai/)",
+]
+no-inline-comments = true
+no-prefix-comments = true
+custom-order = true
+
+[linters]
+default = "none"
+enable = [
+  "bodyclose",
+  "containedctx",
+  "contextcheck",
+  "durationcheck",
+  "err113",
+  "errcheck",
+  "errorlint",
+  "forcetypeassert",
+  "gosec",
+  "govet",
+  "ineffassign",
+  "nilerr",
+  "noctx",
+  "nosprintfhostport",
+  "prealloc",
+  "staticcheck",
+  "unconvert",
+  "unparam",
+  "unused",
+  "usestdlibvars",
+  "wastedassign",
+  "whitespace",
+]
+
+[linters.exclusions]
+generated = "lax"
+presets = [
+  "comments",
+  "common-false-positives",
+  "legacy",
+  "std-error-handling"
+]
+
+  [[linters.exclusions.rules]]
+  path = "(.+)_test\\.go$"
+  linters = [ "err113", "gosec", "noctx" ]
