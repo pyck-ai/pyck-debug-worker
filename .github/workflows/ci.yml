@@ -15,10 +15,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Configure private module access
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PYCK_WIDE_REPO_ACCESS_TOKEN }}@github.com/".insteadOf "https://github.com/"
-
       - uses: arduino/setup-task@v2
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}

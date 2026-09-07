@@ -22,10 +22,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Configure private module access
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PYCK_WIDE_REPO_ACCESS_TOKEN }}@github.com/".insteadOf "https://github.com/"
-
       # goreleaser's sboms: block shells out to syft, which is not preinstalled
       # on the runner. Without this the release fails at the cataloging step.
       - uses: anchore/sbom-action/download-syft@v0
@@ -35,13 +31,9 @@ jobs:
           version: "~> v2"
           args: release --clean
         env:
-          GITHUB_TOKEN: ${{ secrets.PYCK_WIDE_REPO_ACCESS_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
 
-      # Build provenance attestation requires a paid plan for private repos
-      # ("Feature not available for the pyck-ai organization"). Skipped while
-      # private; runs automatically if this repo is ever made public.
       - uses: actions/attest@v4
-        if: ${{ !github.event.repository.private }}
         with:
           subject-checksums: ./dist/checksums.txt
