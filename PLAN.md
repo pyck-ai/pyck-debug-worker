@@ -374,6 +374,143 @@ Rejected on cost: CT signature *verification* (+3.63 MB), embedded HSTS preload
 list (+10.5 MB), UPX (~7 MB achievable, but Windows AV false-positives on a
 diagnostic tool is a bad trade).
 
+## Print check (Kerberos, RHEL 9) — real job, printed once at startup
+
+Original ask: a flag that, on start only (never on the 30s loop), prints the
+first cycle's diagnostic output onto paper on a real Windows print server. This
+submits an actual job — not a connectivity-only proof.
+
+**Constraints that shape it:** RHEL 9 only. The print server has **no Internet
+Printing role**, so there is no IPP/HTTP path. Windows print clients submit jobs
+via **MS-RPRN** (`RpcOpenPrinter` → `RpcStartDocPrinter` → `RpcStartPagePrinter`
+→ `RpcWritePrinter` → `RpcEndPagePrinter` → `RpcEndDocPrinter` →
+`RpcClosePrinter`) over an SMB named pipe (`\pipe\spoolss`). MS-RPRN itself
+carries no authentication — *the SMB session is the authentication* (MS-RPRN
+§2.1) — so a Kerberos-authenticated SMB session is both the auth proof and the
+transport the real job rides on.
+
+### Flag and content
+
+`--print` (bool). Fires **once**, after cycle 1 completes and before the ticker
+starts — never inside the loop. Content is the **exact rendered lines of cycle
+1** (`report.Cycle`, the same text already written to stdout), submitted as a
+`text` datatype job so the print server renders it as plain text.
+
+Unlike the ambient credential-gated stages, `--print` is an explicit imperative:
+if it is set and any of its prerequisites are missing, that is a **startup
+config error, not a silent skip** — exit 2 with the specific missing piece,
+checked at the same door as the task-queue guard.
+
+### Stages
+
+`krb5` → `spn` → `smb` → `share` (unchanged from the connectivity design, table
+below) → **`submit`**, the real MS-RPRN sequence. Only `submit` is new.
+
+| # | stage | api | proves |
+|---|---|---|---|
+| P1 | `krb5` | `keytab.Load` → `client.NewWithKeytab(…, DisablePAFXFAST(true))` → `Login()` | keytab valid, realm right, KDC reachable, clock within skew |
+| P2 | `spn` | `GetServiceTicket("cifs/<fqdn>")` | the print server's SPN is registered in AD |
+| P3 | `smb` | `go-smb2` `Dial` with `Krb5Initiator{TargetSPN: "cifs/<fqdn>"}` to `:445` | the print server **accepted our ticket** |
+| P4 | `share` | `ListSharenames` contains `PYCK_PRINT_SHARE` | the printer is shared under that name |
+| P5 | `submit` | MS-RPRN `RpcOpenPrinter` … `RpcClosePrinter` over the authenticated session, `datatype=text` | **a real job reached the spooler and printed** |
+
+Env: `PYCK_PRINT_SERVER` (**FQDN** — Kerberos cannot map an IP or short name to
+an SPN), `PYCK_PRINT_SHARE` (required when `--print` is set), `PYCK_KRB5_PRINCIPAL`,
+`PYCK_KRB5_KEYTAB` (default `$CREDENTIALS_DIRECTORY/krb5-keytab`), `KRB5_CONFIG`
+(default `/etc/krb5.conf`). Realm from the principal's `@REALM` suffix, else
+`default_realm`.
+
+### Auth implementation
+
+`go-msrpc` is the Go implementation of MS-RPRN and takes a keytab natively
+(`ssp/credential/keytab.go`, with a direct converter from a `gokrb5/v8`
+keytab), so `submit` uses its client end to end — the same keytab as P1–P3,
+no separate credential flow. Only `ssp.SPNEGO` and `ssp.KRB5` are registered;
+there is no NTLM mechanism anywhere in the process.
+
+### Kerberos-or-fail
+
+`gokrb5` offers **only** the Kerberos mech in its SPNEGO token, so an NTLM
+fallback is impossible from our side by construction. Refuse RC4 in
+`krb5.conf`: `permitted_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96`,
+`allow_weak_crypto = false`. Server 2025 DCs no longer issue RC4 TGTs anyway;
+the account must have AES keys (`msDS-SupportedEncryptionTypes = 24`).
+
+### Credential — the RHEL 9 path, and only that path
+
+**One recommended source:** join the box to AD and create a Managed Service
+Account with `adcli create-msa`. SSSD rotates its password every 30 days; no human
+ever knows it. Fallback if IT will not join the box: a keytab exported for a
+dedicated service account.
+
+**One storage mechanism:** systemd encrypted credentials (systemd 252 on RHEL 9;
+`LoadCredentialEncrypted=` since 250). Sealed to the TPM2 and/or host key, only
+decrypted into non-swappable memory while the unit runs, visible to the unit's
+UID only. Works with the existing `DynamicUser=yes`.
+
+```sh
+systemd-creds encrypt --name=krb5-keytab svc.keytab /etc/credstore.encrypted/krb5-keytab
+shred -u svc.keytab
+```
+Use `--with-key=host` on VMs without a vTPM; `auto` fails there.
+
+Delivered as a **drop-in**, not in the base unit — `LoadCredentialEncrypted=`
+has no "optional" form and would fail units that do not use the check:
+`contrib/systemd/pyck-debug-worker@.service.d/kerberos.conf`.
+
+Rotation trap to document: credentials are snapshotted at unit start, so after
+SSSD rotates the MSA key the **next** `Login()` fails with `KDC_ERR_PREAUTH_FAILED`
+until the unit is restarted. Restart, do not debug.
+
+Never: password or keytab bytes in `Environment=`, argv, or the unit file. The
+binary already refuses secret-bearing flags.
+
+### Error taxonomy (string-matched — `krberror` has no `Unwrap`)
+
+| signal | verdict |
+|---|---|
+| `failed to communicate with KDC` | no KDC reachable — DNS/firewall to the DC |
+| `KDC_ERR_PREAUTH_FAILED` | wrong or **stale** keytab (key rotated → restart unit) |
+| `KDC_ERR_C_PRINCIPAL_UNKNOWN` | account missing or disabled |
+| `KRB_AP_ERR_SKEW` | clock skew > 300s — check `chronyc tracking` |
+| `KDC_ERR_ETYPE_NOSUPP` | account has no AES keys (RC4-only) |
+| `KDC_ERR_S_PRINCIPAL_UNKNOWN` | `cifs/<fqdn>` unknown — wrong FQDN or server not domain-joined |
+| `KDC did not respond appropriately to FAST` | AD quirk — `DisablePAFXFAST(true)` missing |
+| SMB session rejected after valid ticket | server-side: account not permitted, or SMB policy |
+| share absent from list | printer not shared under that name |
+| `RpcOpenPrinter`/spooler RPC fault | share exists but isn't a printer, or spooler service down |
+| job accepted but never leaves the queue | driver/paper/offline issue on the printer itself — outside this tool |
+
+### Verification
+
+Samba AD DC in Docker is both the KDC and an SMB server: `samba-tool domain
+provision`, a service user, a `[printers]` share. Forced failures: corrupt
+keytab → `PREAUTH_FAILED`; ask for `cifs/nope.test.lan` → `S_PRINCIPAL_UNKNOWN`;
+`faketime` → `SKEW`; wrong share name → `share` FAIL.
+
+### Cost
+
+Measured, `CGO_ENABLED=0 -trimpath -tags netgo,osusergo -ldflags="-s -w"`,
+linux/amd64: **20.67 MiB before, 27.22 MiB after — +6.55 MiB** for the whole
+feature (`gokrb5/v8` + `CloudSoda/go-smb2` for P1–P4, plus `go-msrpc` with its
+bundled `gokrb5.fork/v9` and `go-smb2.fork` for P5).
+
+Larger than the earlier per-library estimates because `go-msrpc` brings a second
+complete Kerberos and SMB stack of its own: it authenticates from the keytab
+itself rather than accepting the ticket P1–P3 already obtained. That is the cost
+of **auth branch 1** below, which is the branch this needed.
+
+`CGO_ENABLED=0` still cross-compiles cleanly for linux/darwin/windows on
+amd64 and arm64 — no build-config change required.
+
+### Extra README
+
+`contrib/kerberos/README.md`, short: this performs a **real print** — a page
+comes out of a physical printer every time `--print` is set and the worker
+starts. State that plainly at the top, not buried. Then: the AD prerequisites,
+the RHEL 9 credential recipe above, the drop-in, and the error table. Nothing
+about RHEL 8, IPP, or alternatives.
+
 ## Milestones
 
 | M | content | lane |

@@ -74,6 +74,7 @@ an `OVERALL`; SIGINT/SIGTERM prints a run summary.
 |---|---|
 | `--env` | environment to probe, repeatable |
 | `--token-file` | file holding a credential (alternative to the env vars above) |
+| `--print` | after the first cycle, print that cycle's lines on a Windows print server — **a real page comes out** ([setup](contrib/kerberos/README.md)) |
 | `--version` | print version and exit |
 
 ## Run as a service (RHEL / systemd)
@@ -90,6 +91,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now pyck-debug-worker@test.service
 journalctl -u pyck-debug-worker@test -f
 ```
+
+### Printing the first cycle (`--print`)
+
+Kerberos drop-in and the RHEL 9 credential recipe:
+[`contrib/kerberos/README.md`](contrib/kerberos/README.md),
+[`contrib/systemd/pyck-debug-worker@.service.d/kerberos.conf`](contrib/systemd/pyck-debug-worker@.service.d/kerberos.conf).
+Every start with `--print` puts a page in a physical printer's output tray.
 
 The instance name after `@` becomes `--env`, so `pyck-debug-worker@prod.service`
 and `pyck-debug-worker@dev.service` run side by side. The unit runs under

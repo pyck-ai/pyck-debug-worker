@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pyck-ai/pyck-debug-worker/internal/buildinfo"
+	"github.com/pyck-ai/pyck-debug-worker/internal/printcheck"
 	"github.com/pyck-ai/pyck-debug-worker/internal/probe"
 	"github.com/pyck-ai/pyck-debug-worker/internal/report"
 	"github.com/pyck-ai/pyck-debug-worker/internal/secret"
@@ -128,9 +129,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	banner(stdout, targets, creds)
+	// --print is an imperative, not an ambient stage. If it was asked for and
+	// anything it needs is missing, refuse to start — the credential-gated
+	// probe stages skip silently, this one must not.
+	printCfg := printcheck.Load(os.Getenv)
+	if cfg.print {
+		if err := printCfg.Validate(); err != nil {
+			fmt.Fprintf(stderr, "%v: %v\n", errUsage, err)
 
-	return loop(targets, creds, stdout)
+			return exitUsage
+		}
+	}
+
+	banner(stdout, targets, creds, cfg.print, printCfg)
+
+	return loop(targets, creds, printCfg, cfg.print, stdout)
 }
 
 // stringList collects a repeatable flag.
@@ -152,6 +165,7 @@ func (l *stringList) Set(v string) error {
 type config struct {
 	envs      stringList
 	version   bool
+	print     bool
 	tokenFile string
 	fs        *flag.FlagSet
 }
@@ -194,6 +208,9 @@ func parseFlags(args []string, stderr io.Writer) (*config, error) {
 	fs.Var(&cfg.envs, "env", "environment to probe (repeatable): local, dev, test, demo, prod, feature/<branch>")
 	fs.StringVar(&cfg.tokenFile, "token-file", "", "path to a file holding a credential")
 	fs.BoolVar(&cfg.version, "version", false, "print version and exit")
+	fs.BoolVar(&cfg.print, "print", false,
+		"after the first cycle, print that cycle's lines on the Windows print server "+
+			"(a real page comes out of a real printer)")
 
 	cfg.fs = fs
 
@@ -305,7 +322,7 @@ func (c *config) load() (credentials, error) {
 
 // banner prints the effective configuration. Absent credentials are never
 // mentioned.
-func banner(w io.Writer, targets []target.Target, creds credentials) {
+func banner(w io.Writer, targets []target.Target, creds credentials, printing bool, printCfg printcheck.Config) {
 	fmt.Fprintf(w, "pyck-debug-worker %s\n", buildinfo.String())
 	fmt.Fprintf(w, "interval %s  cycle timeout %s  task-queue %s\n",
 		hardcodedInterval, cycleTimeout, hardcodedTaskQueue)
@@ -341,10 +358,16 @@ func banner(w io.Writer, targets []target.Target, creds credentials) {
 	if len(opts) > 0 {
 		fmt.Fprintf(w, "options %s\n", strings.Join(opts, "  "))
 	}
+
+	// Stated plainly, before anything is probed: this run ends with paper.
+	if printing {
+		fmt.Fprintf(w, "print %s as %s — one real job after cycle 1\n",
+			printCfg.UNC(), printCfg.Principal)
+	}
 }
 
 // loop runs cycles until SIGINT/SIGTERM, then prints the run summary.
-func loop(targets []target.Target, creds credentials, out io.Writer) int {
+func loop(targets []target.Target, creds credentials, printCfg printcheck.Config, printing bool, out io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -364,8 +387,10 @@ func loop(targets []target.Target, creds credentials, out io.Writer) int {
 	ticker := time.NewTicker(hardcodedInterval)
 	defer ticker.Stop()
 
+	printFailed := false
+
 	for n := 1; ; n++ {
-		fmt.Fprintln(out, run.Add(cycle(ctx, n, targets, labels, out, probe.Options{
+		probed := cycle(ctx, n, targets, labels, out, probe.Options{
 			Clients:           clients,
 			Token:             creds.token,
 			GatewayURL:        creds.gatewayURL,
@@ -374,7 +399,15 @@ func loop(targets []target.Target, creds credentials, out io.Writer) int {
 			APIKey:            creds.apiKey,
 			Deep:              hardcodedDeep,
 			TaskQueue:         hardcodedTaskQueue,
-		})))
+		})
+
+		fmt.Fprintln(out, run.Add(probed))
+
+		// Once, after the first cycle and before the first tick. Never inside
+		// the loop: every run of this puts a page in a physical output tray.
+		if n == 1 && printing {
+			printFailed = !printOnce(ctx, printCfg, probed, out)
+		}
 
 		select {
 		case <-ctx.Done():
@@ -389,11 +422,35 @@ func loop(targets []target.Target, creds credentials, out io.Writer) int {
 
 	fmt.Fprintln(out, run.Summary(time.Now()))
 
-	if run.Failed() {
+	// A print that was explicitly asked for and did not happen is a failure of
+	// the run, even when every probe cycle was clean.
+	if run.Failed() || printFailed {
 		return exitFailure
 	}
 
 	return exitOK
+}
+
+// printOnce submits the first cycle's own output to the print server and
+// reports whether every stage passed. The job content is exactly the lines
+// already written to stdout for that cycle — nothing synthetic.
+func printOnce(ctx context.Context, cfg printcheck.Config, probed report.Cycle, out io.Writer) bool {
+	lines := make([]string, 0, len(probed.Results))
+	for _, result := range probed.Results {
+		lines = append(lines, result.Line())
+	}
+
+	ok := true
+
+	for _, result := range printcheck.Run(ctx, cfg, lines) {
+		fmt.Fprintln(out, result.Line())
+
+		if !result.OK {
+			ok = false
+		}
+	}
+
+	return ok
 }
 
 // cycle runs one probe cycle under a fresh timeout and prints its result lines.
