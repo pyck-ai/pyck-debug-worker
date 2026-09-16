@@ -49,6 +49,56 @@ this binary, under any branch.
 * **Fallback**, if the host may not be joined: a keytab exported for a
   dedicated service account.
 
+## Keytab from a service-account password
+
+There is no password path in this binary (see above) — a `svc-user` +
+password credential is used exactly once, offline, to derive a keytab. The
+password itself is never stored or run by the worker.
+
+On the Linux host, with `krb5-user`/`krb5-workstation` installed:
+
+```sh
+ktutil
+addent -password -p svc-print@CORP.EXAMPLE.COM -k 1 -e aes256-cts-hmac-sha1-96
+addent -password -p svc-print@CORP.EXAMPLE.COM -k 1 -e aes128-cts-hmac-sha1-96
+wkt svc.keytab
+quit
+```
+
+Each `addent -password` prompts for the account's password interactively; it
+is never written to disk or shell history. `-k 1` is a nominal kvno — gokrb5
+requests kvno 0, which matches any entry, so it does not need to track AD's
+actual key version.
+
+The principal must match the account's `sAMAccountName` **case-exactly**:
+AD derives the AES salt from `REALM+username`, and a case mismatch fails
+Kerberos pre-auth (`KDC_ERR_PREAUTH_FAILED`) even though the password is
+correct. The account also needs `msDS-SupportedEncryptionTypes = 24` (AES
+only), as above.
+
+Alternatively, from a domain-joined Windows host with `ktpass`:
+
+```
+ktpass /princ svc-print@CORP.EXAMPLE.COM /mapuser CORP\svc-print /pass * /crypto AES256-SHA1 /ptype KRB5_NT_PRINCIPAL /out svc.keytab
+```
+
+`/pass *` prompts for the password interactively. Caution: `ktpass` *sets*
+the account's password to whatever is entered and rewrites its UPN — safe
+only if the password entered is the account's current one. Prefer `ktutil`
+when there's a choice.
+
+Before sealing the keytab, verify it actually authenticates:
+
+```sh
+kinit -kt svc.keytab svc-print@CORP.EXAMPLE.COM && klist
+```
+
+Then feed it into the credential storage step below, and `shred -u` the
+plaintext keytab afterward either way.
+
+If the password rotates, regenerate the keytab the same way and restart the
+unit — this is the same rotation trap as the managed-service-account case.
+
 ## Credential (RHEL 9)
 
 One storage mechanism: systemd encrypted credentials, sealed to the TPM2 and/or
