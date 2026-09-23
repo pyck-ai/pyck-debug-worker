@@ -3,7 +3,7 @@
 Standalone diagnostic binary that probes pyck endpoints every 30s across
 DNS → TCP → TLS → HTTP/2 → gRPC → Temporal, including the worker long-poll path.
 
-Single static binary (win/mac/linux × amd64/arm64) + `FROM scratch` container.
+Single static binary (win/mac/linux × amd64/arm64) + `ghcr.io/pyck-ai/baseimages/static` container.
 
 ## Goal / non-goals
 
@@ -304,28 +304,35 @@ timestamp destroys bit-for-bit reproducibility; `-buildvcs` supplies the rest.
 ## Container
 
 ```dockerfile
-FROM scratch
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=build /etc/passwd /etc/passwd
-COPY <<EOF /etc/nsswitch.conf
-hosts: files dns
-EOF
+FROM ghcr.io/pyck-ai/baseimages/static:latest
 COPY --from=build /out/pyck-debug-worker /pyck-debug-worker
-USER 65532:65532
 ENTRYPOINT ["/pyck-debug-worker"]
 ```
 
 Builder is `ghcr.io/pyck-ai/baseimages/golang:1.26-alpine` with BuildKit mod and
 build caches. `CGO_ENABLED=0 -trimpath -tags netgo,osusergo -ldflags="-s -w -X …buildCommit"`.
 
-Gotchas: scratch has none of the six CA paths `crypto/x509` probes, so the bundle
-is mandatory. `/etc/resolv.conf` is runtime-mounted by Docker/K8s — the `dns` stage
-reports the resolver config it used so an odd network mode is visible.
-`netgo,osusergo` are redundant under `CGO_ENABLED=0` but are fail-loud insurance.
-`time/tzdata` is **not** imported; all timestamps are UTC.
+Runtime is `ghcr.io/pyck-ai/baseimages/static:latest`, the house scratch-derived
+image for statically-compiled binaries. It already ships the CA bundle
+(`/etc/ssl/certs/ca-certificates.crt` + `SSL_CERT_FILE`), a minimal
+`/etc/passwd`/`/etc/group` (root + `nonroot`), UTC `/etc/localtime` +
+`/usr/share/zoneinfo`, and defaults to `USER 1001` (numeric — scratch has no
+`/etc/passwd` for a name to resolve against) — so the Dockerfile no longer needs
+to stage the certs bundle itself or set `USER` explicitly. It ships no
+`/etc/nsswitch.conf`; Go's pure-Go resolver falls back to `files dns` order in
+its absence, matching what the tool wants.
 
-Scratch rather than `baseimages/static` is deliberate: for a diagnostic tool,
-"why did TLS fail" must never be "because the base image was clever".
+Gotchas: scratch (via `static`) has none of the six CA paths `crypto/x509`
+probes, but the bundle is provisioned by the base image. `/etc/resolv.conf` is
+runtime-mounted by Docker/K8s — the `dns` stage reports the resolver config it
+used so an odd network mode is visible. `netgo,osusergo` are redundant under
+`CGO_ENABLED=0` but are fail-loud insurance. `time/tzdata` is **not** imported;
+all timestamps are UTC.
+
+Using `baseimages/static` instead of a hand-rolled `FROM scratch` keeps the
+diagnostic surface (certs, passwd, timezone, nonroot uid) on the same audited,
+Renovate-tracked base every other pyck.ai image uses, rather than a bespoke copy
+of the same files maintained only here.
 
 ## Release
 
