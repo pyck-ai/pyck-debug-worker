@@ -3,6 +3,7 @@ package printcheck
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/oiweiwei/go-msrpc/ssp"
 	"github.com/oiweiwei/go-msrpc/ssp/credential"
 	"github.com/oiweiwei/go-msrpc/ssp/gssapi"
+	"github.com/oiweiwei/go-msrpc/ssp/krb5"
 	"github.com/rs/zerolog"
 
 	"github.com/pyck-ai/pyck-debug-worker/internal/report"
@@ -53,6 +55,21 @@ const errorSuccess = 0
 // calls this runs the print check synchronously, so an unbounded stall blocks
 // every subsequent probe cycle behind it.
 const submitTimeout = 20 * time.Second
+
+// kdcTimeout bounds a single KDC dial inside go-msrpc's own Kerberos client.
+// That client is a second, independent one: P1 has already logged in with
+// gokrb5/v8 by the time this stage runs, and go-msrpc's Kerberos SSP goes back
+// to the KDC for its own AS-REQ/TGS-REQ regardless. gokrb5.fork's default dial
+// timeout is five minutes (client/settings.go Dialer), so one silently dropped
+// packet on the way to a KDC stalls the whole stage for minutes — and
+// submitTimeout does not bound it, because go-msrpc builds that security
+// context with a literal context.Background() (smb2/initiator.go) and so never
+// sees the deadline this stage sets.
+//
+// Five seconds is what P1 already allows per KDC (gokrb5/v8
+// client/network.go), and on the healthy path P1 proves the KDC answers in
+// milliseconds. A KDC that has not answered in five seconds is not going to.
+const kdcTimeout = 5 * time.Second
 
 // submitStage performs P5: the real MS-RPRN job.
 //
@@ -105,7 +122,25 @@ func submit(ctx context.Context, cfg Config, payload []byte) (uint32, error) {
 	gssapi.AddMechanism(ssp.SPNEGO)
 	gssapi.AddMechanism(ssp.KRB5)
 
-	dialer := smb2.NewDialer(smb2.WithSecurity(gssapi.WithTargetName(cfg.SPN())))
+	// The Kerberos config is go-msrpc's own, started from its NewConfig so the
+	// DCEStyle, DisablePAFXFAST and AnyServiceClassSPN defaults it needs
+	// against Active Directory are kept; only the KDC dialer is replaced, to
+	// put a bound on the dial that would otherwise stall for five minutes.
+	krb5Config := krb5.NewConfig()
+	krb5Config.KDCDialer = &net.Dialer{Timeout: kdcTimeout}
+
+	// The mechanism type is pinned to SPNEGO explicitly. Supplying any
+	// mechanism config makes gssapi adopt that mechanism's OID as the
+	// context's mechanism type when none was set (gssapi.WithMechanismConfig),
+	// which would select raw Kerberos instead of SPNEGO for the session setup
+	// token — a different wire format than the one that works today. Pinning
+	// it keeps SPNEGO as the wrapper and leaves the config to be picked up by
+	// the Kerberos mechanism inside it.
+	dialer := smb2.NewDialer(smb2.WithSecurity(
+		gssapi.WithTargetName(cfg.SPN()),
+		gssapi.WithMechanismType(ssp.MechanismTypeSPNEGO),
+		ssp.WithKRB5(krb5Config),
+	))
 
 	// go-msrpc narrates the ladder this stage is opaque about — "dialing smb
 	// named pipe", "found established transport", "binding the selected

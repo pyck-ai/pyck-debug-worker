@@ -56,12 +56,19 @@ var taxonomy = []verdict{
 			"so look at the print server and the path to it for what stalls a second concurrent SMB session",
 	},
 	{
-		// The smb stage opens its own session first. If that one was accepted
-		// and this one is not, the credential is not in question: the two use
-		// independent SMB stacks, and only the submit stage's was refused.
+		// Not a refusal, despite how this reads on the wire. A capture of the
+		// stall shows NEGOTIATE sent and answered in under a millisecond and
+		// then SESSION_SETUP never transmitted at all: go-msrpc asks its
+		// Kerberos SSP for the token before it builds the request, and that
+		// SSP runs a second Kerberos client of its own — the login P1 already
+		// completed is not reused — so a KDC that does not answer stalls the
+		// handshake with nothing on the wire. The reset that ends it arrives
+		// later, from the server timing out a connection that went idle.
 		signal: "open smb session",
-		meaning: "the print job's own SMB session was refused although the smb stage's session was accepted — " +
-			"the credential is good; this is go-msrpc's session setup being rejected",
+		meaning: "the SMB2 handshake stalled before session setup was sent — nothing was refused; " +
+			"go-msrpc runs its own second Kerberos client here, and its KDC exchange is what stalls, " +
+			"so check this host's path to a KDC rather than the print server or the credential, " +
+			"both of which the earlier stages already proved",
 	},
 	{
 		signal:  "STATUS_LOGON_FAILURE",
