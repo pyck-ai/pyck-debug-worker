@@ -45,6 +45,17 @@ var taxonomy = []verdict{
 		meaning: "Active Directory FAST quirk — DisablePAFXFAST is not in effect",
 	},
 	{
+		// The submit stage is the only one with a deadline of its own, and it
+		// wraps the whole ladder. This precedes the session entry below
+		// because a stall during session setup carries both signals, and the
+		// deadline is the more specific of the two.
+		signal: "context deadline exceeded",
+		meaning: "the print job did not complete within " + submitTimeout.String() +
+			" — the SMB2 handshake to the print server stalled rather than failing; " +
+			"the credential is not in question, since the earlier stages already proved it, " +
+			"so look at the print server and the path to it for what stalls a second concurrent SMB session",
+	},
+	{
 		// The smb stage opens its own session first. If that one was accepted
 		// and this one is not, the credential is not in question: the two use
 		// independent SMB stacks, and only the submit stage's was refused.

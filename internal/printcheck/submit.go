@@ -3,7 +3,9 @@ package printcheck
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/oiweiwei/go-msrpc/dcerpc"
 	"github.com/oiweiwei/go-msrpc/msrpc/rprn/winspool/v1"
@@ -11,6 +13,7 @@ import (
 	"github.com/oiweiwei/go-msrpc/ssp"
 	"github.com/oiweiwei/go-msrpc/ssp/credential"
 	"github.com/oiweiwei/go-msrpc/ssp/gssapi"
+	"github.com/rs/zerolog"
 
 	"github.com/pyck-ai/pyck-debug-worker/internal/report"
 
@@ -41,6 +44,16 @@ const documentName = "pyck-debug-worker cycle 1"
 // errorSuccess is ERROR_SUCCESS, the only acceptable return from an RPRN call.
 const errorSuccess = 0
 
+// submitTimeout bounds the whole P5 ladder: the SMB dial, NEGOTIATE,
+// SESSION_SETUP, the RPC bind, and the seven RPRN calls. Against a healthy
+// server all of it completes in well under a second — P3 and P4 do the same
+// dial and the same session setup in the same run and report sub-100ms
+// durations, and P5's extra work is seven round trips on an already-open pipe.
+// Anything still running at 20s is stuck rather than slow, and the loop that
+// calls this runs the print check synchronously, so an unbounded stall blocks
+// every subsequent probe cycle behind it.
+const submitTimeout = 20 * time.Second
+
 // submitStage performs P5: the real MS-RPRN job.
 //
 // Authentication branch — go-msrpc's own client, end to end. Its Kerberos SSP
@@ -54,7 +67,10 @@ func submitStage(ctx context.Context, cfg Config, lines []string) report.Result 
 	return stage(cfg, "submit", func() (bool, string) {
 		payload := Payload(lines)
 
-		jobID, err := submit(ctx, cfg, payload)
+		submitCtx, cancel := context.WithTimeout(ctx, submitTimeout)
+		defer cancel()
+
+		jobID, err := submit(submitCtx, cfg, payload)
 		if err != nil {
 			return false, classify(err)
 		}
@@ -91,10 +107,19 @@ func submit(ctx context.Context, cfg Config, payload []byte) (uint32, error) {
 
 	dialer := smb2.NewDialer(smb2.WithSecurity(gssapi.WithTargetName(cfg.SPN())))
 
+	// go-msrpc narrates the ladder this stage is opaque about — "dialing smb
+	// named pipe", "found established transport", "binding the selected
+	// transport" — but only at debug level, so the level is lowered
+	// explicitly. dcerpc.Dial itself opens no socket: it records the options
+	// and the connection is established inside the Bind below, which is why
+	// the logger is passed to both.
+	logger := debugLogger()
+
 	conn, err := dcerpc.Dial(security, cfg.Server,
 		dcerpc.WithSMBDialer(dialer),
 		dcerpc.WithEndpoint(spoolssEndpoint),
 		dcerpc.WithSign(),
+		dcerpc.WithLogger(logger),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("dial %s: %w", spoolssEndpoint, err)
@@ -102,7 +127,7 @@ func submit(ctx context.Context, cfg Config, payload []byte) (uint32, error) {
 
 	defer conn.Close(security)
 
-	spooler, err := winspool.NewWinspoolClient(security, conn, dcerpc.WithSign())
+	spooler, err := winspool.NewWinspoolClient(security, conn, dcerpc.WithSign(), dcerpc.WithLogger(logger))
 	if err != nil {
 		return 0, fmt.Errorf("bind spooler: %w", err)
 	}
@@ -196,6 +221,18 @@ func submit(ctx context.Context, cfg Config, payload []byte) (uint32, error) {
 	}
 
 	return started.JobID, nil
+}
+
+// debugLogger is the DCE/RPC stack's debug log. It goes to stderr so it stays
+// out of the result lines on stdout, and carries a component field so its
+// output is distinguishable from them at a glance.
+func debugLogger() zerolog.Logger {
+	return zerolog.New(os.Stderr).
+		With().
+		Timestamp().
+		Str("component", "print-submit").
+		Logger().
+		Level(zerolog.DebugLevel)
 }
 
 // returned turns a non-zero MS-RPRN return code into an error. The spooler
