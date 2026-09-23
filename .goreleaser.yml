@@ -16,7 +16,7 @@ builds:
       - netgo
       - osusergo
     ldflags:
-      - -s -w -X github.com/pyck-ai/pyck-debug-worker/internal/buildinfo.version={{.Version}} -X github.com/pyck-ai/pyck-debug-worker/internal/buildinfo.commit={{.Commit}}
+      - -s -w -X github.com/pyck-ai/pyck-debug-worker/internal/buildinfo.Version={{.Tag}} -X github.com/pyck-ai/pyck-debug-worker/internal/buildinfo.Commit={{.Commit}}
     goos:
       - linux
       - darwin
