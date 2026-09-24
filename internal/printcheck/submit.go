@@ -100,6 +100,17 @@ const submitTimeout = 20 * time.Second
 // milliseconds. A KDC that has not answered in five seconds is not going to.
 const kdcTimeout = 5 * time.Second
 
+// tcpDialTimeout bounds each TCP connect the TCP transport makes: the
+// endpoint mapper's own dial to port 135, and the dial to the dynamic port it
+// resolves. go-msrpc's own default is 10s (dcerpc/transport_settings.go); a
+// port that is open answers the TCP handshake in milliseconds; one that is
+// merely closed answers with an immediate RST. Only a firewall silently
+// dropping the packets takes any real time at all to fail, and that pattern
+// does not need 10s to be recognized — the whole TCP attempt runs before the
+// pipe is even tried, and it should not eat most of the stage's submitTimeout
+// budget doing so.
+const tcpDialTimeout = 3 * time.Second
+
 // submitStage performs P5: the real MS-RPRN job.
 //
 // Authentication branch — go-msrpc's own client, end to end. Its Kerberos SSP
@@ -327,19 +338,24 @@ func connectTCP(
 	// Unlike the named pipe's, this Dial does open a socket: epm.EndpointMapper
 	// connects to port 135 while constructing the mapper, so a server that is
 	// unreachable or not running an endpoint mapper fails here rather than at
-	// Bind.
+	// Bind. tcpDialTimeout is passed to both: the mapper's own dial to 135,
+	// and — since it is a ConnectOption, read off t.settings.Timeout for the
+	// net.DialTimeout call in dcerpc/conn.go — the dial to whatever dynamic
+	// port the mapper resolves.
 	conn, err := dcerpc.Dial(security, cfg.Server,
 		epm.EndpointMapper(security, cfg.Server,
 			dcerpc.WithSign(),
 			dcerpc.WithTargetName(targetName),
 			dcerpc.WithSecurityConfig(krb5Config),
 			dcerpc.WithLogger(logger),
+			dcerpc.WithTimeout(tcpDialTimeout),
 		),
 		dcerpc.WithEndpoint(tcpEndpoint),
 		dcerpc.WithSign(),
 		dcerpc.WithTargetName(targetName),
 		dcerpc.WithSecurityConfig(krb5Config),
 		dcerpc.WithLogger(logger),
+		dcerpc.WithTimeout(tcpDialTimeout),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial %s: %w", tcpEndpoint, err)
