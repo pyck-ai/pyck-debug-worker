@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/oiweiwei/go-msrpc/dcerpc"
+	"github.com/oiweiwei/go-msrpc/msrpc/epm/epm/v3"
 	"github.com/oiweiwei/go-msrpc/msrpc/rprn/winspool/v1"
 	"github.com/oiweiwei/go-msrpc/smb2"
 	"github.com/oiweiwei/go-msrpc/ssp"
@@ -23,10 +24,38 @@ import (
 	_ "github.com/oiweiwei/go-msrpc/msrpc/erref/win32"
 )
 
-// spoolssEndpoint is the well-known named pipe MS-RPRN is bound to. It is
-// fixed by the protocol (idl/rprn.idl: endpoint("ncacn_np:[\\pipe\\spoolss]")),
-// so the endpoint mapper is not consulted.
+// spoolssEndpoint is the named pipe MS-RPRN's spec binds the interface to
+// (idl/rprn.idl: endpoint("ncacn_np:[\\pipe\\spoolss]")). It is a fixed
+// endpoint, so the endpoint mapper is not consulted for it.
 const spoolssEndpoint = `ncacn_np:[\pipe\spoolss]`
+
+// tcpEndpoint selects the TCP protocol sequence without naming a port. The
+// port is left empty deliberately: the binding is then incomplete
+// (dcerpc/binding.go Complete reports false while Endpoint is ""), which is
+// what makes conn.Bind consult the endpoint mapper to resolve winspool's
+// dynamic port, rather than dialing a port this side guessed. Naming the
+// protocol sequence at all is what keeps the mapper's reply filtered to TCP:
+// epm's Map appends the well-known named-pipe binding to every lookup result,
+// and without this filter that pipe would be dialed as a silent fallback
+// inside the TCP attempt, which would make the two transports
+// indistinguishable in the logs.
+const tcpEndpoint = "ncacn_ip_tcp:"
+
+// tcpServiceClass is the SPN service class for the TCP transport. The named
+// pipe authenticates against the SMB service (cifs/), because its RPC rides
+// on an SMB session; over TCP there is no SMB session and the RPC bind
+// authenticates against the machine itself. Every domain-joined computer
+// registers HOST/<name> at domain join, so this needs nothing configured on
+// the server.
+const tcpServiceClass = "host"
+
+// transportTCP and transportPipe name the two transports in the debug log, so
+// a customer log shows which one carried a successful submit without needing
+// the wire capture that established the distinction in the first place.
+const (
+	transportTCP  = "ncacn_ip_tcp"
+	transportPipe = "ncacn_np"
+)
 
 // printerAccessUse is PRINTER_ACCESS_USE (MS-RPRN §2.2.3.1): the right to
 // submit a job. Nothing here asks for administrative access to the spooler.
@@ -129,43 +158,22 @@ func submit(ctx context.Context, cfg Config, payload []byte) (uint32, error) {
 	krb5Config := krb5.NewConfig()
 	krb5Config.KDCDialer = &net.Dialer{Timeout: kdcTimeout}
 
-	// The mechanism type is pinned to SPNEGO explicitly. Supplying any
-	// mechanism config makes gssapi adopt that mechanism's OID as the
-	// context's mechanism type when none was set (gssapi.WithMechanismConfig),
-	// which would select raw Kerberos instead of SPNEGO for the session setup
-	// token — a different wire format than the one that works today. Pinning
-	// it keeps SPNEGO as the wrapper and leaves the config to be picked up by
-	// the Kerberos mechanism inside it.
-	dialer := smb2.NewDialer(smb2.WithSecurity(
-		gssapi.WithTargetName(cfg.SPN()),
-		gssapi.WithMechanismType(ssp.MechanismTypeSPNEGO),
-		ssp.WithKRB5(krb5Config),
-	))
-
 	// go-msrpc narrates the ladder this stage is opaque about — "dialing smb
 	// named pipe", "found established transport", "binding the selected
 	// transport" — but only at debug level, so the level is lowered
-	// explicitly. dcerpc.Dial itself opens no socket: it records the options
-	// and the connection is established inside the Bind below, which is why
-	// the logger is passed to both.
+	// explicitly. dcerpc.Dial itself opens no socket for the named pipe: it
+	// records the options and the connection is established inside the Bind,
+	// which is why the logger is passed to both.
 	logger := debugLogger()
 
-	conn, err := dcerpc.Dial(security, cfg.Server,
-		dcerpc.WithSMBDialer(dialer),
-		dcerpc.WithEndpoint(spoolssEndpoint),
-		dcerpc.WithSign(),
-		dcerpc.WithLogger(logger),
-	)
+	conn, spooler, transport, err := connect(security, cfg, krb5Config, logger)
 	if err != nil {
-		return 0, fmt.Errorf("dial %s: %w", spoolssEndpoint, err)
+		return 0, err
 	}
 
 	defer conn.Close(security)
 
-	spooler, err := winspool.NewWinspoolClient(security, conn, dcerpc.WithSign(), dcerpc.WithLogger(logger))
-	if err != nil {
-		return 0, fmt.Errorf("bind spooler: %w", err)
-	}
+	logger.Debug().Str("transport", transport).Msg("spooler bound")
 
 	opened, err := spooler.OpenPrinter(security, &winspool.OpenPrinterRequest{
 		PrinterName:      cfg.UNC(),
@@ -256,6 +264,147 @@ func submit(ctx context.Context, cfg Config, payload []byte) (uint32, error) {
 	}
 
 	return started.JobID, nil
+}
+
+// connect binds the spooler over whichever transport the server actually
+// offers, and reports which one that was.
+//
+// TCP is tried first because it is what current Windows listens on. MS-RPRN's
+// spec still documents only the named pipe (MS-RPRN §2.1), but the shipping OS
+// has moved past its own spec: since Windows 11 22H2 the spooler listens on
+// RPC over TCP by default and the named pipe is off unless a policy re-enables
+// it, which is why the pipe's CREATE returns
+// STATUS_OBJECT_NAME_NOT_FOUND on a current server that is otherwise
+// authenticating and sharing the printer correctly.
+//
+// The pipe is kept as the fallback rather than dropped, because it remains the
+// only transport on Server 2016/2019/2022 and on any newer server where the
+// policy has re-enabled it. Neither transport is configured or selected by
+// this side: both are attempted, in that order, on every run.
+func connect(
+	security context.Context,
+	cfg Config,
+	krb5Config *krb5.Config,
+	logger zerolog.Logger,
+) (dcerpc.Conn, winspool.WinspoolClient, string, error) {
+	conn, spooler, err := connectTCP(security, cfg, krb5Config, logger)
+	if err == nil {
+		return conn, spooler, transportTCP, nil
+	}
+
+	// Not a failure of the stage: on a server predating the transport change
+	// this is the expected outcome, and the pipe below is the working path.
+	logger.Debug().Err(err).Msg("rpc over tcp unavailable, falling back to the named pipe")
+
+	conn, spooler, pipeErr := connectPipe(security, cfg, krb5Config, logger)
+	if pipeErr != nil {
+		// Both transports are reported. Either error alone invites the wrong
+		// conclusion: the TCP error alone reads as a firewall problem, and the
+		// pipe error alone reads as a missing printer.
+		return nil, nil, "", fmt.Errorf("%s: %w (%s: %v)", transportPipe, pipeErr, transportTCP, err)
+	}
+
+	return conn, spooler, transportPipe, nil
+}
+
+// connectTCP binds the spooler over ncacn_ip_tcp, resolving winspool's dynamic
+// port through the endpoint mapper on port 135.
+//
+// The authentication moves with the transport. There is no SMB session here,
+// so the Kerberos exchange that the pipe path performs during SMB session
+// setup happens in the RPC bind instead: WithSecurityConfig carries the same
+// krb5 config — and so the same bounded KDC dialer — into the bind's own
+// security context, and WithTargetName supplies the SPN that gssapi.WithTargetName
+// supplies on the SMB side.
+func connectTCP(
+	security context.Context,
+	cfg Config,
+	krb5Config *krb5.Config,
+	logger zerolog.Logger,
+) (dcerpc.Conn, winspool.WinspoolClient, error) {
+	targetName := tcpServiceClass + "/" + cfg.Server
+
+	// Unlike the named pipe's, this Dial does open a socket: epm.EndpointMapper
+	// connects to port 135 while constructing the mapper, so a server that is
+	// unreachable or not running an endpoint mapper fails here rather than at
+	// Bind.
+	conn, err := dcerpc.Dial(security, cfg.Server,
+		epm.EndpointMapper(security, cfg.Server,
+			dcerpc.WithSign(),
+			dcerpc.WithTargetName(targetName),
+			dcerpc.WithSecurityConfig(krb5Config),
+			dcerpc.WithLogger(logger),
+		),
+		dcerpc.WithEndpoint(tcpEndpoint),
+		dcerpc.WithSign(),
+		dcerpc.WithTargetName(targetName),
+		dcerpc.WithSecurityConfig(krb5Config),
+		dcerpc.WithLogger(logger),
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dial %s: %w", tcpEndpoint, err)
+	}
+
+	spooler, err := winspool.NewWinspoolClient(security, conn,
+		dcerpc.WithSign(),
+		dcerpc.WithTargetName(targetName),
+		dcerpc.WithSecurityConfig(krb5Config),
+		dcerpc.WithLogger(logger),
+	)
+	if err != nil {
+		// The connection is closed here rather than left to the caller: the
+		// caller only defers Close for the transport it went on to use, and a
+		// half-established one would otherwise hold its socket for the rest of
+		// the run.
+		_ = conn.Close(security)
+
+		return nil, nil, fmt.Errorf("bind spooler over %s: %w", transportTCP, err)
+	}
+
+	return conn, spooler, nil
+}
+
+// connectPipe binds the spooler over ncacn_np, the transport MS-RPRN's spec
+// documents. This is the v1.1.5 path, unchanged: the SMB dialer carries the
+// Kerberos exchange in the session setup, and the endpoint is fixed by the
+// protocol rather than resolved.
+func connectPipe(
+	security context.Context,
+	cfg Config,
+	krb5Config *krb5.Config,
+	logger zerolog.Logger,
+) (dcerpc.Conn, winspool.WinspoolClient, error) {
+	// The mechanism type is pinned to SPNEGO explicitly. Supplying any
+	// mechanism config makes gssapi adopt that mechanism's OID as the
+	// context's mechanism type when none was set (gssapi.WithMechanismConfig),
+	// which would select raw Kerberos instead of SPNEGO for the session setup
+	// token — a different wire format than the one that works today. Pinning
+	// it keeps SPNEGO as the wrapper and leaves the config to be picked up by
+	// the Kerberos mechanism inside it.
+	dialer := smb2.NewDialer(smb2.WithSecurity(
+		gssapi.WithTargetName(cfg.SPN()),
+		gssapi.WithMechanismType(ssp.MechanismTypeSPNEGO),
+		ssp.WithKRB5(krb5Config),
+	))
+
+	conn, err := dcerpc.Dial(security, cfg.Server,
+		dcerpc.WithSMBDialer(dialer),
+		dcerpc.WithEndpoint(spoolssEndpoint),
+		dcerpc.WithSign(),
+		dcerpc.WithLogger(logger),
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dial %s: %w", spoolssEndpoint, err)
+	}
+
+	spooler, err := winspool.NewWinspoolClient(security, conn, dcerpc.WithSign(), dcerpc.WithLogger(logger))
+	if err != nil {
+		_ = conn.Close(security)
+
+		return nil, nil, fmt.Errorf("bind spooler: %w", err)
+	}
+
+	return conn, spooler, nil
 }
 
 // debugLogger is the DCE/RPC stack's debug log. It goes to stderr so it stays

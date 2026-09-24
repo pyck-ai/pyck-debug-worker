@@ -419,13 +419,40 @@ below) → **`submit`**, the real MS-RPRN sequence. Only `submit` is new.
 | P2 | `spn` | `GetServiceTicket("cifs/<fqdn>")` | the print server's SPN is registered in AD |
 | P3 | `smb` | `go-smb2` `Dial` with `Krb5Initiator{TargetSPN: "cifs/<fqdn>"}` to `:445` | the print server **accepted our ticket** |
 | P4 | `share` | `ListSharenames` contains `PYCK_PRINT_SHARE` | the printer is shared under that name |
-| P5 | `submit` | MS-RPRN `RpcOpenPrinter` … `RpcClosePrinter` over the authenticated session, `datatype=text` | **a real job reached the spooler and printed** |
+| P5 | `submit` | MS-RPRN `RpcOpenPrinter` … `RpcClosePrinter`, `datatype=text`, over TCP first and the named pipe second | **a real job reached the spooler and printed** |
 
 Env: `PYCK_PRINT_SERVER` (**FQDN** — Kerberos cannot map an IP or short name to
 an SPN), `PYCK_PRINT_SHARE` (required when `--print` is set), `PYCK_KRB5_PRINCIPAL`,
 `PYCK_KRB5_KEYTAB` (default `$CREDENTIALS_DIRECTORY/krb5-keytab`), `KRB5_CONFIG`
 (default `/etc/krb5.conf`). Realm from the principal's `@REALM` suffix, else
 `default_realm`.
+
+### Transport auto-detection (P5)
+
+MS-RPRN's spec documents exactly one transport, the `\pipe\spoolss` named pipe
+(MS-RPRN §2.1), but the shipping OS has moved past its own spec: since Windows
+11 22H2 the spooler listens on RPC over TCP by default and the named pipe is off
+unless a policy re-enables it. A current server therefore fails the pipe's CREATE
+with `STATUS_OBJECT_NAME_NOT_FOUND` while authenticating and sharing the printer
+correctly — the failure looks like a missing printer and is not one. P5 tries TCP
+first and falls back to the pipe, on every run; nothing is configured on this side.
+
+| Windows version | Default spooler RPC transport | Policy | Named pipe still available? |
+|---|---|---|---|
+| Server 2016 / 2019 / 2022, Windows 10 (pre-22H2) | named pipe over SMB (`ncacn_np`) — the only one MS-RPRN describes | n/a, predates the RPC transport policies | yes, it is the only path |
+| Windows 11 22H2+ (build 10.0.22621+) | RPC over TCP (`ncacn_ip_tcp`), dynamic port via the endpoint mapper on 135 | Computer Configuration > Administrative Templates > Printers > "Configure RPC connection settings" / "Configure RPC listener settings" — TCP-only by default | only if re-enabled by policy |
+| Server 2025 (build 10.0.26100, Win11 24H2 codebase) | presumed TCP-only | same policies, presumed applicable | presumed the same |
+
+The Server 2025 row is inferred from the shared codebase — Microsoft has
+published no Server-specific statement, and it is the row to re-check first if
+P5's transport behaviour ever surprises.
+
+The two transports authenticate differently, which is why the fallback is a
+separate bind rather than a retry: the pipe's RPC rides on an SMB session and
+authenticates in the session setup against `cifs/<fqdn>`, while over TCP there is
+no SMB session and the RPC bind itself authenticates against `host/<fqdn>`. Both
+SPNs are registered on every domain-joined computer object at join, so neither
+needs provisioning.
 
 ### Auth implementation
 
