@@ -2,6 +2,7 @@ package printcheck
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -129,12 +130,47 @@ func submitStage(ctx context.Context, cfg Config, lines []string) report.Result 
 
 		jobID, err := submit(submitCtx, cfg, payload)
 		if err != nil {
-			return false, classify(err)
+			return false, submitDetail(debugLogger(), err)
 		}
 
 		return true, fmt.Sprintf("job %d spooled to %s: %d bytes, %d lines, datatype=%s",
 			jobID, cfg.UNC(), len(payload), len(lines), datatypeText)
 	})
+}
+
+// submitDetail splits a failed submit between the two streams.
+//
+// The raw errors go to the debug stream on stderr, one per line, each verbatim
+// and unaccompanied: the operator asked for the libraries' own output, not for
+// it to be explained, and this stage's errors nest two transports deep, so one
+// flattened line is unreadable however it is punctuated. What comes back is
+// the single line the result column holds, which is the taxonomy's verdict
+// where there is one and the error's own top frame where there is not.
+//
+// The two streams rather than extra results: report.Run.Add tallies one n/m
+// per Result, so a raw error line returned as a Result would count as a stage
+// that ran and failed, and the cycle's "OK n/m" would report more stages than
+// the ladder has. The debug stream is already where the libraries narrate, and
+// after this release it renders in the same fixed-width shape as the result
+// lines, so the two read as one log.
+func submitDetail(logger zerolog.Logger, err error) string {
+	lines := chainLines(err)
+
+	for _, line := range lines {
+		logger.Error().Msg(line)
+	}
+
+	if verdict := verdictOf(err); verdict != "" {
+		return verdict
+	}
+
+	// No verdict: the top frame is the most specific thing that can honestly
+	// be said, and the rest is already on the debug stream.
+	if len(lines) > 0 {
+		return lines[0]
+	}
+
+	return err.Error()
 }
 
 // Payload renders the cycle's lines as the job body. CRLF is the only
@@ -309,10 +345,19 @@ func connect(
 
 	conn, spooler, pipeErr := connectPipe(security, cfg, krb5Config, logger)
 	if pipeErr != nil {
-		// Both transports are reported. Either error alone invites the wrong
-		// conclusion: the TCP error alone reads as a firewall problem, and the
-		// pipe error alone reads as a missing printer.
-		return nil, nil, "", fmt.Errorf("%s: %w (%s: %v)", transportPipe, pipeErr, transportTCP, err)
+		// Both transports are reported, and both stay unwrappable. Either
+		// error alone invites the wrong conclusion: the TCP error alone reads
+		// as a firewall problem, and the pipe error alone reads as a missing
+		// printer. Until v1.2.0 the second was folded in with %v, which
+		// flattened its chain into the first's text and left the operator one
+		// line with the other transport's errors nested in parentheses;
+		// errors.Join keeps them as two chains that chainLines can walk
+		// separately. The pipe is named first because it is the transport the
+		// ladder ended on.
+		return nil, nil, "", errors.Join(
+			fmt.Errorf("%s: %w", transportPipe, pipeErr),
+			fmt.Errorf("%s: %w", transportTCP, err),
+		)
 	}
 
 	return conn, spooler, transportPipe, nil
@@ -423,17 +468,83 @@ func connectPipe(
 	return conn, spooler, nil
 }
 
+// debugComponent labels the stream in its own column, so a journal that
+// interleaves it with the result lines still attributes each line.
+const debugComponent = "print-submit"
+
+// debugComponentW and debugLevelW are the widths of the two fixed columns the
+// debug stream carries between its timestamp and its message. The component is
+// sized to its only content; the level is four to match the width the result
+// lines give their own ok/FAIL status column, which puts the same two-space
+// gap in front of the message that every other column boundary has.
+const (
+	debugComponentW = len(debugComponent)
+	debugLevelW     = 4
+)
+
 // debugLogger is the DCE/RPC stack's debug log. It goes to stderr so it stays
-// out of the result lines on stdout, and carries a component field so its
-// output is distinguishable from them at a glance.
+// out of the result lines on stdout, and it renders in the same fixed-width
+// shape those lines use rather than in JSON:
+//
+//	<ts>  <component>  <lvl>  <message>  <key>=<value> …
+//
+// The timestamp column matches report.Result.Line exactly — same layout, same
+// UTC — so both streams line up when journalctl shows them together. Colour is
+// off because the destination is journald, where ANSI escapes are noise.
 func debugLogger() zerolog.Logger {
-	return zerolog.New(os.Stderr).
+	writer := zerolog.ConsoleWriter{
+		Out:     os.Stderr,
+		NoColor: true,
+		// zerolog re-parses its own timestamp before formatting, and does so
+		// in TimeLocation — so UTC has to be named here, or the local zone
+		// would render (the JSON stream's +02:00 in the customer log is
+		// exactly that).
+		TimeFormat:   report.TSLayout,
+		TimeLocation: time.UTC,
+		// The component is promoted to a part so it renders as a column, and
+		// excluded from the trailing fields so it is not also repeated as
+		// component=print-submit on all forty lines.
+		PartsOrder: []string{
+			zerolog.TimestampFieldName,
+			componentField,
+			zerolog.LevelFieldName,
+			zerolog.MessageFieldName,
+		},
+		FieldsExclude: []string{componentField},
+		FormatPartValueByName: func(value any, name string) string {
+			if name != componentField {
+				return fmt.Sprintf("%s", value)
+			}
+
+			return fmt.Sprintf(" %-*s", debugComponentW, value)
+		},
+		// zerolog's own level formatter colourises and abbreviates to three;
+		// this one only pads, to the same width the result lines give their
+		// status column.
+		FormatLevel: func(value any) string {
+			level := strings.ToUpper(fmt.Sprintf("%s", value))
+			if len(level) > debugLevelW {
+				level = level[:debugLevelW]
+			}
+
+			return fmt.Sprintf(" %-*s", debugLevelW, level)
+		},
+		FormatFieldName:  func(value any) string { return fmt.Sprintf("%s=", value) },
+		FormatFieldValue: func(value any) string { return fmt.Sprintf("%s", value) },
+	}
+
+	return zerolog.New(writer).
 		With().
 		Timestamp().
-		Str("component", "print-submit").
+		Str(componentField, debugComponent).
 		Logger().
 		Level(zerolog.DebugLevel)
 }
+
+// componentField is the key the component travels under. It is a part name as
+// well as a field name, which is why it is a constant rather than a literal in
+// both places.
+const componentField = "component"
 
 // returned turns a non-zero MS-RPRN return code into an error. The spooler
 // reports failures in the return value, not only in the RPC fault, so a call

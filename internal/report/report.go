@@ -14,8 +14,11 @@ import (
 
 // Layouts and column widths of the rendered output.
 const (
-	// tsLayout is UTC RFC3339 at second precision.
-	tsLayout = "2006-01-02T15:04:05Z"
+	// TSLayout is UTC RFC3339 at second precision. It is exported because the
+	// stderr debug stream renders its own timestamps with it, so that stream
+	// and these result lines share one timestamp column in the journal rather
+	// than each inventing a layout.
+	TSLayout = "2006-01-02T15:04:05Z"
 	// clockLayout is the wall clock used for "last fail".
 	clockLayout = "15:04:05"
 
@@ -56,7 +59,7 @@ type Result struct {
 //	<ts>  <target>  <stage>  <status>  <duration>  <detail>
 func (r Result) Line() string {
 	line := fmt.Sprintf("%s  %-*s  %-*s  %*s  %*s  %s",
-		r.Ts.UTC().Format(tsLayout),
+		r.Ts.UTC().Format(TSLayout),
 		targetW, r.Target,
 		stageW, r.Stage,
 		statusW, lineStatus(r.OK),
@@ -200,7 +203,7 @@ func (r *Run) renderCycle(c Cycle, order []string, stats map[string]*targetStat)
 	})
 
 	title := fmt.Sprintf("cycle %d  %s  %s",
-		c.N, c.At.UTC().Format(tsLayout), formatDuration(c.Duration))
+		c.N, c.At.UTC().Format(TSLayout), formatDuration(c.Duration))
 
 	return block(title, rows)
 }
