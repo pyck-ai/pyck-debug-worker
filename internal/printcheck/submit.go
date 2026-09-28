@@ -11,6 +11,7 @@ import (
 
 	"github.com/oiweiwei/go-msrpc/dcerpc"
 	"github.com/oiweiwei/go-msrpc/msrpc/epm/epm/v3"
+	"github.com/oiweiwei/go-msrpc/msrpc/par/iremotewinspool/v1"
 	"github.com/oiweiwei/go-msrpc/msrpc/rprn/winspool/v1"
 	"github.com/oiweiwei/go-msrpc/smb2"
 	"github.com/oiweiwei/go-msrpc/ssp"
@@ -33,7 +34,7 @@ const spoolssEndpoint = `ncacn_np:[\pipe\spoolss]`
 // tcpEndpoint selects the TCP protocol sequence without naming a port. The
 // port is left empty deliberately: the binding is then incomplete
 // (dcerpc/binding.go Complete reports false while Endpoint is ""), which is
-// what makes conn.Bind consult the endpoint mapper to resolve winspool's
+// what makes conn.Bind consult the endpoint mapper to resolve IRemoteWinspool's
 // dynamic port, rather than dialing a port this side guessed. Naming the
 // protocol sequence at all is what keeps the mapper's reply filtered to TCP:
 // epm's Map appends the well-known named-pipe binding to every lookup result,
@@ -50,11 +51,19 @@ const tcpEndpoint = "ncacn_ip_tcp:"
 // the server.
 const tcpServiceClass = "host"
 
-// transportTCP and transportPipe name the two transports in the debug log, so
+// transportPAR and transportPipe name the two transports in the debug log, so
 // a customer log shows which one carried a successful submit without needing
 // the wire capture that established the distinction in the first place.
+//
+// The values stay protocol sequences, but the two constants name different
+// interfaces as well as different wires: transportPAR is MS-PAR's
+// IRemoteWinspool at PKT_PRIVACY over TCP, transportPipe is MS-RPRN's winspool
+// at PKT_INTEGRITY over \pipe\spoolss. There is no winspool-over-TCP pairing
+// any more; through v1.2.2 the TCP attempt bound winspool at sign, which is
+// not a combination Windows serves, and the identifier was renamed so that
+// nothing still reads as if it were.
 const (
-	transportTCP  = "ncacn_ip_tcp"
+	transportPAR  = "ncacn_ip_tcp"
 	transportPipe = "ncacn_np"
 )
 
@@ -64,6 +73,14 @@ const printerAccessUse = 0x00000008
 
 // docInfoLevel1 selects the DOC_INFO_1 structure (MS-RPRN §2.2.1.4).
 const docInfoLevel1 = 1
+
+// splClientInfoLevel1 selects SPLCLIENT_INFO_1, the only level MS-RPRN allows
+// in an SPLCLIENT_CONTAINER.
+const splClientInfoLevel1 = 1
+
+// splClientInfo1Size is SPLCLIENT_INFO_1's dwSize as Samba's spoolss client
+// sends it: the structure's size in its 32-bit layout.
+const splClientInfo1Size = 28
 
 // datatypeText asks the spooler's text print processor to render the job, so
 // the diagnostic lines come out as plain text rather than being interpreted as
@@ -77,7 +94,7 @@ const documentName = "pyck-debug-worker cycle 1"
 const errorSuccess = 0
 
 // submitTimeout bounds the whole P5 ladder: the SMB dial, NEGOTIATE,
-// SESSION_SETUP, the RPC bind, and the seven RPRN calls. Against a healthy
+// SESSION_SETUP, the RPC bind, and the seven spooler calls. Against a healthy
 // server all of it completes in well under a second — P3 and P4 do the same
 // dial and the same session setup in the same run and report sub-100ms
 // durations, and P5's extra work is seven round trips on an already-open pipe.
@@ -112,7 +129,8 @@ const kdcTimeout = 5 * time.Second
 // budget doing so.
 const tcpDialTimeout = 3 * time.Second
 
-// submitStage performs P5: the real MS-RPRN job.
+// submitStage performs P5: the real print job, over MS-PAR or, failing that,
+// MS-RPRN.
 //
 // Authentication branch — go-msrpc's own client, end to end. Its Kerberos SSP
 // accepts a keytab credential natively (ssp/credential/keytab.go
@@ -183,9 +201,10 @@ func Payload(lines []string) []byte {
 	return []byte(strings.Join(lines, "\r\n") + "\r\n")
 }
 
-// submit runs the MS-RPRN sequence: RpcOpenPrinter, RpcStartDocPrinter,
-// RpcStartPagePrinter, RpcWritePrinter, RpcEndPagePrinter, RpcEndDocPrinter,
-// RpcClosePrinter.
+// submit binds the spooler and runs the seven-call job sequence over whichever
+// interface the bind landed on: MS-PAR's RpcAsyncOpenPrinter …
+// RpcAsyncClosePrinter over TCP, or MS-RPRN's RpcOpenPrinter … RpcClosePrinter
+// over the named pipe.
 func submit(ctx context.Context, cfg Config, payload []byte) (uint32, error) {
 	security := gssapi.NewSecurityContext(ctx)
 
@@ -213,7 +232,7 @@ func submit(ctx context.Context, cfg Config, payload []byte) (uint32, error) {
 	// which is why the logger is passed to both.
 	logger := debugLogger()
 
-	conn, spooler, transport, err := connect(security, cfg, krb5Config, logger)
+	conn, parSpooler, pipeSpooler, transport, err := connect(security, cfg, krb5Config, logger)
 	if err != nil {
 		return 0, err
 	}
@@ -222,6 +241,30 @@ func submit(ctx context.Context, cfg Config, payload []byte) (uint32, error) {
 
 	logger.Debug().Str("transport", transport).Msg("spooler bound")
 
+	// Two job bodies rather than one behind an interface: MS-PAR and MS-RPRN
+	// carry the same seven operations, but go-msrpc generates each interface
+	// its own request, response and context-handle types, so a printer handle
+	// from one is not even the same Go type as a handle from the other. A
+	// shared abstraction over them would be an adapter layer written only to
+	// be read past; two straight-line bodies are what a reader diffs against
+	// a wire capture.
+	if transport == transportPAR {
+		return submitOverPAR(security, parSpooler, cfg, payload)
+	}
+
+	return submitOverPipe(security, pipeSpooler, cfg, payload)
+}
+
+// submitOverPipe runs the MS-RPRN sequence over the named pipe:
+// RpcOpenPrinter, RpcStartDocPrinter, RpcStartPagePrinter, RpcWritePrinter,
+// RpcEndPagePrinter, RpcEndDocPrinter, RpcClosePrinter. This is the job body
+// the stage has always run, moved out of submit unchanged.
+func submitOverPipe(
+	security context.Context,
+	spooler winspool.WinspoolClient,
+	cfg Config,
+	payload []byte,
+) (uint32, error) {
 	opened, err := spooler.OpenPrinter(security, &winspool.OpenPrinterRequest{
 		PrinterName:      cfg.UNC(),
 		DevModeContainer: &winspool.DevModeContainer{},
@@ -313,37 +356,180 @@ func submit(ctx context.Context, cfg Config, payload []byte) (uint32, error) {
 	return started.JobID, nil
 }
 
-// connect binds the spooler over whichever transport the server actually
-// offers, and reports which one that was.
+// submitOverPAR runs the MS-PAR sequence over TCP: RpcAsyncOpenPrinter,
+// RpcAsyncStartDocPrinter, RpcAsyncStartPagePrinter, RpcAsyncWritePrinter,
+// RpcAsyncEndPagePrinter, RpcAsyncEndDocPrinter, RpcAsyncClosePrinter.
 //
-// TCP is tried first because it is what current Windows listens on. MS-RPRN's
-// spec still documents only the named pipe (MS-RPRN §2.1), but the shipping OS
-// has moved past its own spec: since Windows 11 22H2 the spooler listens on
-// RPC over TCP by default and the named pipe is off unless a policy re-enables
-// it, which is why the pipe's CREATE returns
+// It is submitOverPipe call for call. MS-PAR defines its job operations as the
+// asynchronous counterparts of MS-RPRN's and reuses MS-RPRN's structures for
+// their arguments, so the access mask, the DOC_INFO_1 level and the TEXT
+// datatype mean exactly what they mean on the pipe. The errors name the
+// RpcAsync operations because those are the opnums on the wire; a failure
+// reported as RpcOpenPrinter here would send the reader to the wrong
+// interface's documentation.
+//
+// RpcAsyncOpenPrinter takes two arguments RpcOpenPrinter does not. pDatatype
+// is unique and left null, in which case the job's own DOC_INFO_1 datatype
+// governs, as it does on the pipe. pClientInfo is not optional: it is a [ref]
+// pointer to an SPLCLIENT_CONTAINER whose Level "MUST be 0x00000001" (MS-RPRN
+// §2.2.1.2.14), and go-msrpc refuses to marshal the zero-value container
+// (Level 0 is not a union arm), so leaving it empty fails the call locally
+// before anything is sent. Only the size, machine and user are filled in; the
+// build and version fields describe a Windows client and stay zero.
+func submitOverPAR(
+	security context.Context,
+	spooler iremotewinspool.RemoteWinspoolClient,
+	cfg Config,
+	payload []byte,
+) (uint32, error) {
+	hostname, _ := os.Hostname()
+
+	opened, err := spooler.OpenPrinter(security, &iremotewinspool.OpenPrinterRequest{
+		PrinterName:      cfg.UNC(),
+		DevModeContainer: &iremotewinspool.DevModeContainer{},
+		AccessRequired:   printerAccessUse,
+		ClientInfo: &iremotewinspool.ClientContainer{
+			Level: splClientInfoLevel1,
+			ClientInfo: &iremotewinspool.ClientContainer_ClientInfo{
+				Value: &iremotewinspool.ClientContainer_ClientInfo_ClientInfo1{
+					ClientInfo1: &iremotewinspool.ClientInfo1{
+						Size:        splClientInfo1Size,
+						MachineName: hostname,
+						UserName:    cfg.User(),
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("RpcAsyncOpenPrinter %s: %w", cfg.UNC(), err)
+	}
+
+	if err := returned("RpcAsyncOpenPrinter", opened.Return); err != nil {
+		return 0, err
+	}
+
+	printer := opened.Handle
+
+	// From here the printer handle is open; every path must close it.
+	defer func() {
+		_, _ = spooler.ClosePrinter(security, &iremotewinspool.ClosePrinterRequest{Printer: printer})
+	}()
+
+	started, err := spooler.StartDocPrinter(security, &iremotewinspool.StartDocPrinterRequest{
+		Printer: printer,
+		DocInfoContainer: &iremotewinspool.DocInfoContainer{
+			Level: docInfoLevel1,
+			DocInfo: &iremotewinspool.DocInfoContainer_DocInfo{
+				Value: &iremotewinspool.DocInfoContainer_DocInfo1{
+					DocInfo1: &iremotewinspool.DocInfo1{
+						DocName:  documentName,
+						DataType: datatypeText,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("RpcAsyncStartDocPrinter: %w", err)
+	}
+
+	if err := returned("RpcAsyncStartDocPrinter", started.Return); err != nil {
+		return 0, err
+	}
+
+	page, err := spooler.StartPagePrinter(security, &iremotewinspool.StartPagePrinterRequest{Printer: printer})
+	if err != nil {
+		return started.JobID, fmt.Errorf("RpcAsyncStartPagePrinter: %w", err)
+	}
+
+	if err := returned("RpcAsyncStartPagePrinter", page.Return); err != nil {
+		return started.JobID, err
+	}
+
+	written, err := spooler.WritePrinter(security, &iremotewinspool.WritePrinterRequest{
+		Printer:      printer,
+		Buffer:       payload,
+		BufferLength: uint32(len(payload)),
+	})
+	if err != nil {
+		return started.JobID, fmt.Errorf("RpcAsyncWritePrinter: %w", err)
+	}
+
+	if err := returned("RpcAsyncWritePrinter", written.Return); err != nil {
+		return started.JobID, err
+	}
+
+	if int(written.WrittenCount) != len(payload) {
+		return started.JobID, fmt.Errorf(
+			"RpcAsyncWritePrinter accepted %d of %d bytes: the job would print truncated",
+			written.WrittenCount, len(payload))
+	}
+
+	endPage, err := spooler.EndPagePrinter(security, &iremotewinspool.EndPagePrinterRequest{Printer: printer})
+	if err != nil {
+		return started.JobID, fmt.Errorf("RpcAsyncEndPagePrinter: %w", err)
+	}
+
+	if err := returned("RpcAsyncEndPagePrinter", endPage.Return); err != nil {
+		return started.JobID, err
+	}
+
+	endDoc, err := spooler.EndDocPrinter(security, &iremotewinspool.EndDocPrinterRequest{Printer: printer})
+	if err != nil {
+		return started.JobID, fmt.Errorf("RpcAsyncEndDocPrinter: %w", err)
+	}
+
+	if err := returned("RpcAsyncEndDocPrinter", endDoc.Return); err != nil {
+		return started.JobID, err
+	}
+
+	return started.JobID, nil
+}
+
+// connect binds the spooler over whichever transport the server actually
+// offers, and reports which one that was. Exactly one of the two returned
+// clients is non-nil, and the returned transport says which.
+//
+// MS-PAR over TCP is tried first because it is what Windows clients speak
+// first. A Windows client does not run MS-RPRN over TCP at all: over TCP it
+// binds a different interface, MS-PAR's IRemoteWinspool, at
+// RPC_C_AUTHN_LEVEL_PKT_PRIVACY, and only if that fails does it fall back to
+// MS-RPRN over \pipe\spoolss (MS-PAR Appendix B, note <38>: Vista and later
+// try MS-PAR first). Since Windows 11 22H2 the named pipe is off by default
+// unless a policy re-enables it, which is why the pipe's CREATE returns
 // STATUS_OBJECT_NAME_NOT_FOUND on a current server that is otherwise
-// authenticating and sharing the printer correctly.
+// authenticating and sharing the printer correctly — MS-PAR is then the only
+// way in.
+//
+// Through v1.2.2 the TCP attempt bound MS-RPRN's winspool interface at sign
+// instead. That is not a path Windows serves, and a server answers it the way
+// it answers any bind below the interface's required authentication level: the
+// first call, RpcOpenPrinter, faults in the RPC runtime with status 5. That
+// reads like the spooler refusing the printer, but the spooler never saw the
+// call.
 //
 // The pipe is kept as the fallback rather than dropped, because it remains the
-// only transport on Server 2016/2019/2022 and on any newer server where the
-// policy has re-enabled it. Neither transport is configured or selected by
-// this side: both are attempted, in that order, on every run.
+// path on Server 2016/2019/2022 and on any newer server where the policy has
+// re-enabled it, and it is what a Windows client falls back to as well.
+// Neither transport is configured or selected by this side: both are
+// attempted, in that order, on every run.
 func connect(
 	security context.Context,
 	cfg Config,
 	krb5Config *krb5.Config,
 	logger zerolog.Logger,
-) (dcerpc.Conn, winspool.WinspoolClient, string, error) {
-	conn, spooler, err := connectTCP(security, cfg, krb5Config, logger)
+) (dcerpc.Conn, iremotewinspool.RemoteWinspoolClient, winspool.WinspoolClient, string, error) {
+	conn, parSpooler, err := connectPAR(security, cfg, krb5Config, logger)
 	if err == nil {
-		return conn, spooler, transportTCP, nil
+		return conn, parSpooler, nil, transportPAR, nil
 	}
 
-	// Not a failure of the stage: on a server predating the transport change
-	// this is the expected outcome, and the pipe below is the working path.
-	logger.Debug().Err(err).Msg("rpc over tcp unavailable, falling back to the named pipe")
+	// Not a failure of the stage: on a server that does not offer MS-PAR over
+	// TCP this is the expected outcome, and the pipe below is the working path.
+	logger.Debug().Err(err).Msg("ms-par over tcp unavailable, falling back to the named pipe")
 
-	conn, spooler, pipeErr := connectPipe(security, cfg, krb5Config, logger)
+	conn, pipeSpooler, pipeErr := connectPipe(security, cfg, krb5Config, logger)
 	if pipeErr != nil {
 		// Both transports are reported, and both stay unwrappable. Either
 		// error alone invites the wrong conclusion: the TCP error alone reads
@@ -354,17 +540,19 @@ func connect(
 		// errors.Join keeps them as two chains that chainLines can walk
 		// separately. The pipe is named first because it is the transport the
 		// ladder ended on.
-		return nil, nil, "", errors.Join(
+		return nil, nil, nil, "", errors.Join(
 			fmt.Errorf("%s: %w", transportPipe, pipeErr),
-			fmt.Errorf("%s: %w", transportTCP, err),
+			fmt.Errorf("%s: %w", transportPAR, err),
 		)
 	}
 
-	return conn, spooler, transportPipe, nil
+	return conn, nil, pipeSpooler, transportPipe, nil
 }
 
-// connectTCP binds the spooler over ncacn_ip_tcp, resolving winspool's dynamic
-// port through the endpoint mapper on port 135.
+// connectPAR binds MS-PAR's IRemoteWinspool over ncacn_ip_tcp, resolving its
+// dynamic port through the endpoint mapper on port 135. The interface itself
+// is not named here: NewRemoteWinspoolClient adds its abstract syntax to the
+// bind, the same way NewWinspoolClient does for the pipe.
 //
 // The authentication moves with the transport. There is no SMB session here,
 // so the Kerberos exchange that the pipe path performs during SMB session
@@ -372,12 +560,20 @@ func connect(
 // krb5 config — and so the same bounded KDC dialer — into the bind's own
 // security context, and WithTargetName supplies the SPN that gssapi.WithTargetName
 // supplies on the SMB side.
-func connectTCP(
+//
+// Every option set asks for seal, not sign. MS-PAR requires
+// RPC_C_AUTHN_LEVEL_PKT_PRIVACY (MS-PAR §2.1), and a bind below it is refused
+// by the RPC runtime before the spooler sees a single call. The pipe stays at
+// sign: that is the level MS-RPRN over \pipe\spoolss has been working at since
+// v1.1.5, and that path is deliberately left untouched. The endpoint mapper's
+// lookup is sealed as well, so this attempt carries one authentication level
+// from port 135 onward rather than two.
+func connectPAR(
 	security context.Context,
 	cfg Config,
 	krb5Config *krb5.Config,
 	logger zerolog.Logger,
-) (dcerpc.Conn, winspool.WinspoolClient, error) {
+) (dcerpc.Conn, iremotewinspool.RemoteWinspoolClient, error) {
 	targetName := tcpServiceClass + "/" + cfg.Server
 
 	// Unlike the named pipe's, this Dial does open a socket: epm.EndpointMapper
@@ -389,14 +585,14 @@ func connectTCP(
 	// port the mapper resolves.
 	conn, err := dcerpc.Dial(security, cfg.Server,
 		epm.EndpointMapper(security, cfg.Server,
-			dcerpc.WithSign(),
+			dcerpc.WithSeal(),
 			dcerpc.WithTargetName(targetName),
 			dcerpc.WithSecurityConfig(krb5Config),
 			dcerpc.WithLogger(logger),
 			dcerpc.WithTimeout(tcpDialTimeout),
 		),
 		dcerpc.WithEndpoint(tcpEndpoint),
-		dcerpc.WithSign(),
+		dcerpc.WithSeal(),
 		dcerpc.WithTargetName(targetName),
 		dcerpc.WithSecurityConfig(krb5Config),
 		dcerpc.WithLogger(logger),
@@ -406,8 +602,8 @@ func connectTCP(
 		return nil, nil, fmt.Errorf("dial %s: %w", tcpEndpoint, err)
 	}
 
-	spooler, err := winspool.NewWinspoolClient(security, conn,
-		dcerpc.WithSign(),
+	spooler, err := iremotewinspool.NewRemoteWinspoolClient(security, conn,
+		dcerpc.WithSeal(),
 		dcerpc.WithTargetName(targetName),
 		dcerpc.WithSecurityConfig(krb5Config),
 		dcerpc.WithLogger(logger),
@@ -419,7 +615,7 @@ func connectTCP(
 		// the run.
 		_ = conn.Close(security)
 
-		return nil, nil, fmt.Errorf("bind spooler over %s: %w", transportTCP, err)
+		return nil, nil, fmt.Errorf("bind spooler over %s: %w", transportPAR, err)
 	}
 
 	return conn, spooler, nil

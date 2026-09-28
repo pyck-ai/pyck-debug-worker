@@ -6,10 +6,12 @@
 // never again.
 //
 // The print server has no Internet Printing role, so there is no IPP path.
-// Windows clients submit jobs with MS-RPRN over the \pipe\spoolss named pipe,
-// and MS-RPRN carries no authentication of its own (MS-RPRN §2.1) — the SMB
-// session is the authentication. That is why the ladder below ends in a real
-// job: the same session that proves the credential is the one the job rides on.
+// Windows clients submit jobs with MS-PAR over RPC on TCP first, authenticated
+// by Kerberos in the RPC bind itself at packet privacy, and fall back to
+// MS-RPRN over the \pipe\spoolss named pipe. MS-RPRN carries no authentication
+// of its own (MS-RPRN §2.1) — on the pipe the SMB session is the
+// authentication. Either way the ladder below ends in a real job, because the
+// same credential that the earlier stages prove is the one the job rides on.
 package printcheck
 
 import (

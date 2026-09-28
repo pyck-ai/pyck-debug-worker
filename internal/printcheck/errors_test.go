@@ -233,7 +233,7 @@ func TestChainLines(t *testing.T) {
 			err: errors.Join(
 				fmt.Errorf("%s: %w", transportPipe,
 					fmt.Errorf("dial: %w", errors.New("lookup PRINT01: i/o timeout"))),
-				fmt.Errorf("%s: %w", transportTCP,
+				fmt.Errorf("%s: %w", transportPAR,
 					fmt.Errorf("bind spooler: %w", errors.New("write buffer: context deadline exceeded"))),
 			),
 			want: []string{
@@ -269,7 +269,7 @@ func TestChainLinesAddsNoCommentary(t *testing.T) {
 	// appear somewhere in the original error text, so nothing was invented.
 	err := errors.Join(
 		fmt.Errorf("%s: %w", transportPipe, errors.New("lookup PRINT01: i/o timeout")),
-		fmt.Errorf("%s: %w", transportTCP, errors.New("write buffer: context deadline exceeded")),
+		fmt.Errorf("%s: %w", transportPAR, errors.New("write buffer: context deadline exceeded")),
 	)
 
 	for _, line := range chainLines(err) {
@@ -285,8 +285,8 @@ func TestSubmitDetailSplitsTheVerdictFromTheEvidence(t *testing.T) {
 		fmt.Errorf("%s: %w", transportPipe,
 			fmt.Errorf("dial: lookup server address: %w",
 				errors.New("lookup PRINT01.AD.EXAMPLE.COM: i/o timeout"))),
-		fmt.Errorf("%s: %w", transportTCP,
-			fmt.Errorf("bind spooler over %s: %w", transportTCP,
+		fmt.Errorf("%s: %w", transportPAR,
+			fmt.Errorf("bind spooler over %s: %w", transportPAR,
 				errors.New("bind: write packet: write buffer: context deadline exceeded"))),
 	)
 
