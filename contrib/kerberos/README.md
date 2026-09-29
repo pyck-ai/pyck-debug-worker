@@ -1,10 +1,18 @@
 # Print check (`--print`)
 
 **This performs a real print.** Every time the worker starts with `--print`, a
-page comes out of a physical printer. It is not a connectivity test that stops
-at "the spooler answered": the first cycle's own diagnostic lines are submitted
-to the Windows spooler as a real job. Point it at a low-cost or disposable
-printer.
+label comes out of a physical printer. It is not a connectivity test that stops
+at "the spooler answered": the first cycle's own diagnostic lines are posted to
+`fax.pyck.cloud`, and a QR code linking to them is spooled to the Windows print
+server as a real job. Point it at a low-cost or disposable printer.
+
+Requirements beyond the Kerberos setup below:
+
+* The printer share must be a **ZPL label printer** (Zebra or compatible). The
+  job is raw ZPL written straight into the share, with no driver rendering it;
+  any other printer prints it as garbage or not at all.
+* The host needs **outbound HTTPS** to `fax.pyck.cloud` (stores the lines) and
+  `barcodes.pyck.cloud` (renders the QR code as ZPL).
 
 It fires **once**, after the first cycle and before the first tick — never on
 the 30s loop.
@@ -21,12 +29,14 @@ rather than starting and skipping it.
 | P2 | `spn` | `cifs/<fqdn>` is registered in Active Directory |
 | P3 | `smb` | the print server accepted our ticket |
 | P4 | `share` | the printer is shared under that name |
-| P5 | `submit` | a real job reached the spooler and printed |
+| P5 | `fax` | the lines were stored at `https://fax.pyck.cloud/<uuid>`, whole |
+| P6 | `zpl` | `barcodes.pyck.cloud` rendered that URL as a ZPL QR label |
+| P7 | `submit` | the label was written into the printer share and taken as a job |
 
-The print server has no Internet Printing role, so there is no IPP path.
-Windows clients submit jobs over MS-RPRN on the `\pipe\spoolss` named pipe, and
-MS-RPRN carries no authentication of its own (MS-RPRN §2.1) — the SMB session
-*is* the authentication.
+The print server has no Internet Printing role, so there is no IPP path. A
+Windows printer share accepts a file written into it as a raw print job — the
+same thing `smbclient //server/share -c 'print file'` does — so the job rides
+on the SMB session from P3, and that session *is* the authentication.
 
 Kerberos or nothing. There is no NTLM path and no password path anywhere in
 this binary, under any branch.
@@ -172,5 +182,6 @@ Refuse RC4 in `krb5.conf`:
 | `KDC did not respond appropriately to FAST` | AD quirk — `DisablePAFXFAST(true)` missing |
 | SMB session rejected after a valid ticket | server-side: account not permitted, or SMB policy |
 | share absent from list | printer not shared under that name |
-| `RpcOpenPrinter`/spooler RPC fault | share exists but is not a printer, or the spooler service is down |
-| job accepted but never leaves the queue | driver/paper/offline issue on the printer itself — outside this tool |
+| `fax`/`zpl` HTTP error or timeout | no outbound HTTPS to `fax.pyck.cloud` / `barcodes.pyck.cloud` |
+| `STATUS_ACCESS_DENIED` on `submit` | authenticated, but this account may not print to that share |
+| job accepted but no label comes out | not a ZPL printer, or a paper/offline issue on the printer itself — outside this tool |

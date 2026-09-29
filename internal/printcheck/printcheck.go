@@ -2,20 +2,16 @@
 // a Kerberos-authenticated SMB session.
 //
 // This is not a connectivity probe that stops at "the port answered": when it
-// runs, paper comes out of a printer. It runs once, after the first cycle, and
-// never again.
+// runs, a label comes out of a printer. It runs once, after the first cycle,
+// and never again.
 //
-// The print server has no Internet Printing role, so there is no IPP path.
-// Windows clients submit jobs with MS-PAR over RPC on TCP first, authenticated
-// by Kerberos in the RPC bind itself at packet privacy, and fall back to
-// MS-RPRN over the \pipe\spoolss named pipe. MS-RPRN carries no authentication
-// of its own (MS-RPRN §2.1) — on the pipe the SMB session is the
-// authentication. Either way the ladder below ends in a real job, because the
-// same credential that the earlier stages prove is the one the job rides on.
-//
-// ModeSMB replaces that last step for label printers: the lines go to the fax
-// service, and a QR code pointing at them is written as raw ZPL straight into
-// the printer share over the same SMB session (smbprint.go).
+// The print server has no Internet Printing role, so there is no IPP path. The
+// job is written straight into the printer share instead, which a Windows
+// print server accepts as a raw job: the SMB session is the authentication, so
+// the same credential that the earlier stages prove is the one the job rides
+// on. The printer is a ZPL label printer, so the job is a QR code rather than
+// the cycle's text: the lines are posted to the fax service, and the label
+// points at them (print.go).
 package printcheck
 
 import (
@@ -23,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -55,7 +52,7 @@ const (
 	defaultKrb5Conf = "/etc/krb5.conf"
 	// credentialName is the systemd credential the keytab arrives as.
 	credentialName = "krb5-keytab"
-	// smbPort is the only port MS-RPRN's named pipe is reachable on.
+	// smbPort is the SMB port the printer share is reached on.
 	smbPort = "445"
 	// serviceClass is the SPN class for the SMB service.
 	serviceClass = "cifs"
@@ -201,22 +198,23 @@ func (c Config) Address() string {
 	return net.JoinHostPort(c.Server, smbPort)
 }
 
-// UNC is the printer's UNC path, which is what RpcOpenPrinter is given.
+// UNC is the printer share's UNC path, which is what the label is written to.
 func (c Config) UNC() string {
 	return `\\` + c.Server + `\` + c.Share
 }
 
 // Run executes the print ladder once and returns one Result per stage that
 // ran. lines are the rendered result lines of the first cycle — the exact text
-// already written to stdout — and they are what gets printed.
+// already written to stdout — and they are what the printed label points at.
+//
+// What comes out of the printer is a pointer to the lines rather than the
+// lines themselves, because the target is a label printer: a 200-dot label
+// holds a QR code, not forty lines of text. Scanning it opens the lines.
 //
 // The stages are strictly sequential: each one consumes the artifact the
 // previous one produced, so a failure is attributable to a layer instead of
 // being guessed at from one opaque error.
-//
-// mode only changes what follows P4: ModeRPC runs P5 submit, ModeSMB runs the
-// fax, zpl and submit stages of runSMB instead.
-func Run(ctx context.Context, cfg Config, lines []string, mode Mode) []report.Result {
+func Run(ctx context.Context, cfg Config, lines []string) []report.Result {
 	var results []report.Result
 
 	// P1 krb5: the keytab is valid, the realm is right, a KDC answered, and
@@ -252,12 +250,27 @@ func Run(ctx context.Context, cfg Config, lines []string, mode Mode) []report.Re
 		return results
 	}
 
-	if mode == ModeSMB {
-		return append(results, runSMB(ctx, cfg, session, lines)...)
+	httpClient := &http.Client{Timeout: httpTimeout}
+
+	// P5 fax: the lines are stored and reachable at a URL of their own.
+	id, faxURL, result := faxStage(ctx, cfg, httpClient, lines)
+	results = append(results, result)
+
+	if !result.OK {
+		return results
 	}
 
-	// P5 submit: a real job reaches the spooler.
-	return append(results, submitStage(ctx, cfg, lines))
+	// P6 zpl: that URL is rendered as a QR label in the printer's own
+	// language.
+	zpl, result := zplStage(ctx, cfg, httpClient, faxURL)
+	results = append(results, result)
+
+	if !result.OK {
+		return results
+	}
+
+	// P7 submit: the label reaches the spooler through the share.
+	return append(results, spoolStage(ctx, cfg, session, id, faxURL, zpl))
 }
 
 // loginStage performs P1.

@@ -250,8 +250,8 @@ func TestPayload(t *testing.T) {
 			want:  "2026-09-07T10:00:00Z  test.pyck.cloud:443  dns(ip4)  ok  0s  1 addrs\r\n",
 		},
 		{
-			// The spooler is a Windows text print processor: CRLF is the only
-			// transformation applied to the diagnostic output.
+			// CRLF is the only transformation applied to the diagnostic
+			// output.
 			name:  "lines are joined with CRLF and terminated",
 			lines: []string{"first", "second", "third"},
 			want:  "first\r\nsecond\r\nthird\r\n",
@@ -268,7 +268,7 @@ func TestPayload(t *testing.T) {
 }
 
 func TestPayloadPreservesContentVerbatim(t *testing.T) {
-	// The job must carry the cycle's own output, not a rewritten version of it.
+	// The fax must carry the cycle's own output, not a rewritten version of it.
 	lines := []string{
 		`2026-09-07T10:00:00Z  wf.test.pyck.cloud:443    chain        ok      30ms  leaf -> YR1 -> ISRG Root X1 verified  scts=2`,
 		`2026-09-07T10:00:00Z  wf.test.pyck.cloud:443    health       ok      25ms  SERVING`,
@@ -293,7 +293,7 @@ func TestRunStopsAtTheFirstFailedStage(t *testing.T) {
 		Krb5Conf:  filepath.Join(t.TempDir(), "absent.conf"),
 	}
 
-	results := Run(t.Context(), cfg, []string{"line"}, ModeRPC)
+	results := Run(t.Context(), cfg, []string{"line"})
 
 	if len(results) != 1 {
 		t.Fatalf("got %d results, want exactly the failed krb5 stage: %+v", len(results), results)

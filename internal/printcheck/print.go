@@ -17,21 +17,10 @@ import (
 	"github.com/pyck-ai/pyck-debug-worker/internal/report"
 )
 
-// Mode selects how the job, once P1–P4 have passed, reaches the printer.
-type Mode string
-
-const (
-	// ModeRPC submits the cycle's lines as a text job through the spooler's
-	// RPC interfaces (submit.go). It is the default.
-	ModeRPC Mode = "rpc"
-	// ModeSMB writes a ZPL label straight into the printer share (this file).
-	ModeSMB Mode = "smb"
-)
-
-// faxBaseURL and barcodeBaseURL are the two pyck services the smb mode talks
-// to. They are hardcoded like every other endpoint this binary knows; they
-// are variables rather than constants only so the tests can point them at an
-// httptest server.
+// faxBaseURL and barcodeBaseURL are the two pyck services the print check
+// talks to. They are hardcoded like every other endpoint this binary knows;
+// they are variables rather than constants only so the tests can point them
+// at an httptest server.
 var (
 	faxBaseURL     = "https://fax.pyck.cloud/"
 	barcodeBaseURL = "https://barcodes.pyck.cloud/barcode/qr/"
@@ -41,9 +30,9 @@ var (
 // answer a request this size in milliseconds; ten seconds is stuck, not slow.
 const httpTimeout = 10 * time.Second
 
-// spoolTimeout bounds the SMB write, for the same reason submitTimeout bounds
-// the RPC submit: the print check runs synchronously ahead of every later
-// probe cycle, so a stalled write must not hold the loop.
+// spoolTimeout bounds the SMB write. The print check runs synchronously ahead
+// of every later probe cycle, so a stalled write must not hold the loop; a
+// label this size spools in milliseconds against a healthy server.
 const spoolTimeout = 20 * time.Second
 
 // faxReply is the fax service's acknowledgement. Only the fields the stage
@@ -54,36 +43,14 @@ type faxReply struct {
 	Truncated bool   `json:"truncated"`
 }
 
-// runSMB is the smb mode's tail of the ladder, run after P4 on the session P3
-// established: the cycle's lines are posted to the fax service, the fax's URL
-// is turned into a QR label, and the label is written into the printer share.
-//
-// What comes out of the printer is a pointer to the lines rather than the
-// lines themselves, because the target is a label printer: a 200-dot label
-// holds a QR code, not forty lines of text. Scanning it opens exactly what the
-// RPC mode would have printed.
-//
-// The stages are sequential for the same reason P1–P5 are: each consumes the
-// previous one's artifact — the fax URL, then the ZPL — so the first failure
-// is where it stops.
-func runSMB(ctx context.Context, cfg Config, session *smb2.Session, lines []string) []report.Result {
-	httpClient := &http.Client{Timeout: httpTimeout}
-
-	id, faxURL, result := faxStage(ctx, cfg, httpClient, lines)
-	results := []report.Result{result}
-
-	if !result.OK {
-		return results
+// Payload renders the cycle's lines as the fax body. CRLF is the only
+// transformation: the content is the diagnostic output verbatim.
+func Payload(lines []string) []byte {
+	if len(lines) == 0 {
+		return nil
 	}
 
-	zpl, result := zplStage(ctx, cfg, httpClient, faxURL)
-	results = append(results, result)
-
-	if !result.OK {
-		return results
-	}
-
-	return append(results, spoolStage(ctx, cfg, session, id, faxURL, zpl))
+	return []byte(strings.Join(lines, "\r\n") + "\r\n")
 }
 
 // faxStage posts the first cycle's lines to the fax service under a fresh ID
@@ -192,9 +159,8 @@ func zplStage(ctx context.Context, cfg Config, httpClient *http.Client, faxURL s
 // A Windows printer share accepts a file write as a raw print job: the
 // server's spooler takes the bytes and hands them to the printer untouched,
 // which is exactly what `smbclient -c 'print file'` does. So this needs no
-// RPC interface, no second connection, and no second Kerberos client — the
-// session that P3 authenticated is the credential the job rides on, and that
-// is all the smb mode proves beyond P4.
+// spooler RPC interface, no second connection, and no second Kerberos client:
+// the session that P3 authenticated is the credential the job rides on.
 //
 // The Close error is checked, not dropped: the write only fills the spool
 // file, and it is at Close that the spooler takes it as a job.
