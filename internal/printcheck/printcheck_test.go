@@ -293,7 +293,7 @@ func TestRunStopsAtTheFirstFailedStage(t *testing.T) {
 		Krb5Conf:  filepath.Join(t.TempDir(), "absent.conf"),
 	}
 
-	results := Run(t.Context(), cfg, []string{"line"})
+	results := Run(t.Context(), cfg, []string{"line"}, ModeRPC)
 
 	if len(results) != 1 {
 		t.Fatalf("got %d results, want exactly the failed krb5 stage: %+v", len(results), results)

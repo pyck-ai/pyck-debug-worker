@@ -141,9 +141,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	banner(stdout, targets, creds, cfg.print, printCfg)
+	banner(stdout, targets, creds, cfg.print, printCfg, cfg.printMode)
 
-	return loop(targets, creds, printCfg, cfg.print, stdout)
+	return loop(targets, creds, printCfg, cfg.print, cfg.printMode, stdout)
 }
 
 // stringList collects a repeatable flag.
@@ -166,6 +166,7 @@ type config struct {
 	envs      stringList
 	version   bool
 	print     bool
+	printMode printcheck.Mode
 	tokenFile string
 	fs        *flag.FlagSet
 }
@@ -212,6 +213,12 @@ func parseFlags(args []string, stderr io.Writer) (*config, error) {
 		"after the first cycle, print that cycle's lines on the Windows print server "+
 			"(a real page comes out of a real printer)")
 
+	var printMode string
+
+	fs.StringVar(&printMode, "print-mode", string(printcheck.ModeRPC),
+		"how --print reaches the printer: rpc (a text job via the spooler's RPC interfaces) "+
+			"or smb (a ZPL QR label written into the printer share)")
+
 	cfg.fs = fs
 
 	if err := fs.Parse(args); err != nil {
@@ -220,6 +227,14 @@ func parseFlags(args []string, stderr io.Writer) (*config, error) {
 
 	if fs.NArg() > 0 {
 		return nil, fmt.Errorf("%w: unexpected argument %q", errUsage, fs.Arg(0))
+	}
+
+	switch mode := printcheck.Mode(printMode); mode {
+	case printcheck.ModeRPC, printcheck.ModeSMB:
+		cfg.printMode = mode
+	default:
+		return nil, fmt.Errorf("%w: --print-mode=%q: want %s or %s",
+			errUsage, printMode, printcheck.ModeRPC, printcheck.ModeSMB)
 	}
 
 	return cfg, nil
@@ -322,7 +337,14 @@ func (c *config) load() (credentials, error) {
 
 // banner prints the effective configuration. Absent credentials are never
 // mentioned.
-func banner(w io.Writer, targets []target.Target, creds credentials, printing bool, printCfg printcheck.Config) {
+func banner(
+	w io.Writer,
+	targets []target.Target,
+	creds credentials,
+	printing bool,
+	printCfg printcheck.Config,
+	printMode printcheck.Mode,
+) {
 	fmt.Fprintf(w, "pyck-debug-worker %s\n", buildinfo.String())
 	fmt.Fprintf(w, "interval %s  cycle timeout %s  task-queue %s\n",
 		hardcodedInterval, cycleTimeout, hardcodedTaskQueue)
@@ -361,13 +383,20 @@ func banner(w io.Writer, targets []target.Target, creds credentials, printing bo
 
 	// Stated plainly, before anything is probed: this run ends with paper.
 	if printing {
-		fmt.Fprintf(w, "print %s as %s — one real job after cycle 1\n",
-			printCfg.UNC(), printCfg.Principal)
+		fmt.Fprintf(w, "print %s as %s (mode %s) — one real job after cycle 1\n",
+			printCfg.UNC(), printCfg.Principal, printMode)
 	}
 }
 
 // loop runs cycles until SIGINT/SIGTERM, then prints the run summary.
-func loop(targets []target.Target, creds credentials, printCfg printcheck.Config, printing bool, out io.Writer) int {
+func loop(
+	targets []target.Target,
+	creds credentials,
+	printCfg printcheck.Config,
+	printing bool,
+	printMode printcheck.Mode,
+	out io.Writer,
+) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -406,7 +435,7 @@ func loop(targets []target.Target, creds credentials, printCfg printcheck.Config
 		// Once, after the first cycle and before the first tick. Never inside
 		// the loop: every run of this puts a page in a physical output tray.
 		if n == 1 && printing {
-			printFailed = !printOnce(ctx, printCfg, probed, out)
+			printFailed = !printOnce(ctx, printCfg, printMode, probed, out)
 		}
 
 		select {
@@ -434,7 +463,13 @@ func loop(targets []target.Target, creds credentials, printCfg printcheck.Config
 // printOnce submits the first cycle's own output to the print server and
 // reports whether every stage passed. The job content is exactly the lines
 // already written to stdout for that cycle — nothing synthetic.
-func printOnce(ctx context.Context, cfg printcheck.Config, probed report.Cycle, out io.Writer) bool {
+func printOnce(
+	ctx context.Context,
+	cfg printcheck.Config,
+	mode printcheck.Mode,
+	probed report.Cycle,
+	out io.Writer,
+) bool {
 	lines := make([]string, 0, len(probed.Results))
 	for _, result := range probed.Results {
 		lines = append(lines, result.Line())
@@ -442,7 +477,7 @@ func printOnce(ctx context.Context, cfg printcheck.Config, probed report.Cycle, 
 
 	ok := true
 
-	for _, result := range printcheck.Run(ctx, cfg, lines) {
+	for _, result := range printcheck.Run(ctx, cfg, lines, mode) {
 		fmt.Fprintln(out, result.Line())
 
 		if !result.OK {

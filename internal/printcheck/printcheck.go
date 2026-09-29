@@ -12,6 +12,10 @@
 // of its own (MS-RPRN §2.1) — on the pipe the SMB session is the
 // authentication. Either way the ladder below ends in a real job, because the
 // same credential that the earlier stages prove is the one the job rides on.
+//
+// ModeSMB replaces that last step for label printers: the lines go to the fax
+// service, and a QR code pointing at them is written as raw ZPL straight into
+// the printer share over the same SMB session (smbprint.go).
 package printcheck
 
 import (
@@ -209,7 +213,10 @@ func (c Config) UNC() string {
 // The stages are strictly sequential: each one consumes the artifact the
 // previous one produced, so a failure is attributable to a layer instead of
 // being guessed at from one opaque error.
-func Run(ctx context.Context, cfg Config, lines []string) []report.Result {
+//
+// mode only changes what follows P4: ModeRPC runs P5 submit, ModeSMB runs the
+// fax, zpl and submit stages of runSMB instead.
+func Run(ctx context.Context, cfg Config, lines []string, mode Mode) []report.Result {
 	var results []report.Result
 
 	// P1 krb5: the keytab is valid, the realm is right, a KDC answered, and
@@ -243,6 +250,10 @@ func Run(ctx context.Context, cfg Config, lines []string) []report.Result {
 	results = append(results, shareStage(session, cfg))
 	if !last(results).OK {
 		return results
+	}
+
+	if mode == ModeSMB {
+		return append(results, runSMB(ctx, cfg, session, lines)...)
 	}
 
 	// P5 submit: a real job reaches the spooler.
