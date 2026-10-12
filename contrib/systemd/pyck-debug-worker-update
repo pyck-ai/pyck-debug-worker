@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Pull-based auto-updater for /usr/local/bin/pyck-debug-worker. Installs the
+# newest GitHub release with the same major version as the installed binary,
+# restarts the running pyck-debug-worker@ instances and rolls back if they do
+# not come up. Run by pyck-debug-worker-update.service/.timer.
+#
+# Optional: GITHUB_TOKEN (read-only Contents on the repo) for a private repo.
+set -euo pipefail
+
+REPO=pyck-ai/pyck-debug-worker
+API=https://api.github.com/repos/$REPO
+BIN=/usr/local/bin/pyck-debug-worker
+LOCK=/run/lock/pyck-debug-worker-update.lock
+
+log() { printf '%s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# GET from the GitHub API. The token goes through a curl config on a
+# process-substituted fd, so it never shows up in argv. curl does not forward
+# the Authorization header across the redirect to object storage.
+github() {
+  local url=$1; shift
+  if [[ -n ${GITHUB_TOKEN:-} ]]; then
+    curl -fsSL -K <(printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN") "$@" "$url"
+  else
+    curl -fsSL "$@" "$url"
+  fi
+}
+
+# Atomically replace $BIN with $1.
+install_bin() {
+  install -m0755 "$1" /usr/local/bin/.pyck-debug-worker.new
+  mv -f /usr/local/bin/.pyck-debug-worker.new "$BIN"
+}
+
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  log "another update is already running, exiting"
+  exit 0
+fi
+
+[[ -x $BIN ]] || die "$BIN not found"
+current=$("$BIN" --version)
+current=${current%% *}
+[[ $current =~ ^v([0-9]+)\.[0-9]+\.[0-9]+$ ]] || die "cannot parse installed version '$current'"
+major=${BASH_REMATCH[1]}
+
+releases=$(github "$API/releases?per_page=100")
+target=$(jq -r --arg re "^v${major}\\.[0-9]+\\.[0-9]+$" \
+  '.[] | select((.draft or .prerelease) | not) | .tag_name | select(test($re))' <<<"$releases" |
+  sort -V | tail -n1)
+if [[ -z $target || $(printf '%s\n' "$current" "$target" | sort -V | tail -n1) == "$current" ]]; then
+  log "up to date ($current)"
+  exit 0
+fi
+
+case $(uname -m) in
+  x86_64) arch=amd64 ;;
+  aarch64) arch=arm64 ;;
+  *) die "unsupported architecture $(uname -m)" ;;
+esac
+
+tarball=pyck-debug-worker_${target#v}_linux_${arch}.tar.gz
+asset_id() {
+  jq -er --arg tag "$target" --arg name "$1" \
+    '.[] | select(.tag_name == $tag) | .assets[] | select(.name == $name) | .id' <<<"$releases" ||
+    die "release $target has no asset $1"
+}
+tarball_id=$(asset_id "$tarball")
+checksums_id=$(asset_id checksums.txt)
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+log "downloading $target ($tarball)"
+github "$API/releases/assets/$tarball_id" -H 'Accept: application/octet-stream' -o "$tmp/$tarball"
+github "$API/releases/assets/$checksums_id" -H 'Accept: application/octet-stream' -o "$tmp/checksums.txt"
+
+grep -qE "^[0-9a-f]{64}  ${tarball//./\\.}\$" "$tmp/checksums.txt" || die "$tarball is not listed in checksums.txt"
+(cd "$tmp" && sha256sum -c --ignore-missing --quiet checksums.txt) || die "checksum mismatch for $tarball"
+tar -xzf "$tmp/$tarball" -C "$tmp" pyck-debug-worker
+new=$("$tmp/pyck-debug-worker" --version)
+[[ ${new%% *} == "$target" ]] || die "downloaded binary reports '$new', expected $target"
+
+units=()
+while read -r unit _; do
+  units+=("$unit")
+done < <(systemctl list-units --state=active --plain --no-legend 'pyck-debug-worker@*.service')
+
+log "updating $current -> $target, instances: ${units[*]:-none}"
+if ((${#units[@]})); then
+  log "stopping ${units[*]}"
+  systemctl stop "${units[@]}"
+fi
+cp -p "$BIN" "$BIN.prev"
+install_bin "$tmp/pyck-debug-worker"
+((${#units[@]})) || { log "updated to $target (no active instances)"; exit 0; }
+
+log "starting ${units[*]}"
+systemctl start "${units[@]}" || true
+sleep 10
+failed=()
+for unit in "${units[@]}"; do
+  systemctl is-active --quiet "$unit" || failed+=("$unit")
+done
+((${#failed[@]})) || { log "updated to $target"; exit 0; }
+
+log "not active after update: ${failed[*]}; rolling back to $current"
+systemctl stop "${units[@]}" || true
+install_bin "$BIN.prev"
+systemctl start "${units[@]}" || true
+die "update to $target failed health check, rolled back to $current"

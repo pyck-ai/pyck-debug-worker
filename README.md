@@ -107,6 +107,31 @@ and `pyck-debug-worker@dev.service` run side by side. The unit runs under
 `DynamicUser` with no filesystem writes and no capabilities — matching the
 env-only, read-only design above.
 
+### Auto-update
+
+[`contrib/systemd/pyck-debug-worker-update`](contrib/systemd/pyck-debug-worker-update)
+plus its `.service`/`.timer` check GitHub releases hourly. On a newer release it
+downloads the linux tarball, verifies it against `checksums.txt` and its
+`--version`, **stops** the active `pyck-debug-worker@` instances, swaps the
+binary atomically (old one kept as `pyck-debug-worker.prev`), then starts them
+again. If any instance is not active 10s later, it restores the old binary and
+restarts it. It only follows the **installed major version**: a major upgrade is
+a manual install, and the timer then follows the new major.
+
+```sh
+sudo install -D -m 0755 contrib/systemd/pyck-debug-worker-update /usr/local/libexec/pyck-debug-worker-update
+sudo install -m 0644 contrib/systemd/pyck-debug-worker-update.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pyck-debug-worker-update.timer
+sudo systemctl start pyck-debug-worker-update.service   # run now
+journalctl -u pyck-debug-worker-update
+```
+
+Private repo: put a read-only fine-grained token in
+`/etc/sysconfig/pyck-debug-worker-update`
+([example](contrib/systemd/pyck-debug-worker-update.sysconfig.example)), separate
+from the worker's file so the worker never sees it.
+
 ## Exit codes
 
 `0` every cycle clean · `1` any cycle had a failure · `2` config or usage error.

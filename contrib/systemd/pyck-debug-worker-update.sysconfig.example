@@ -1,0 +1,19 @@
+# Example EnvironmentFile for contrib/systemd/pyck-debug-worker-update.service.
+#
+# Only needed while the GitHub repo is private; public releases download
+# anonymously. Install at this path, mode 0600, owned by root:
+#
+#   sudo install -m 0600 pyck-debug-worker-update.sysconfig.example \
+#     /etc/sysconfig/pyck-debug-worker-update
+#
+# Deliberately a separate file from /etc/sysconfig/pyck-debug-worker, so the
+# token never ends up in the worker's environment.
+#
+# Create the token on GitHub: Settings → Developer settings → Fine-grained
+# personal access token → Resource owner: pyck-ai → Only select repositories:
+# pyck-ai/pyck-debug-worker → Repository permissions: Contents: Read-only.
+#
+# GitHub deploy keys do NOT work: they are SSH/git-only and cannot download
+# release assets.
+
+#GITHUB_TOKEN=
