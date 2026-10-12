@@ -1,0 +1,13 @@
+# Hourly trigger for pyck-debug-worker-update.service.
+
+[Unit]
+Description=Hourly pyck-debug-worker auto-update
+Documentation=https://github.com/pyck-ai/pyck-debug-worker
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

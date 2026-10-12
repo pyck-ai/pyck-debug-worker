@@ -9,6 +9,14 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now pyck-debug-worker@test.service
 #
+# Auto-update (optional; hourly, same major version only):
+#   sudo install -D -m 0755 pyck-debug-worker-update /usr/local/libexec/pyck-debug-worker-update
+#   sudo install -m 0644 pyck-debug-worker-update.service pyck-debug-worker-update.timer /etc/systemd/system/
+#   # private repo only:
+#   sudo install -m 0600 pyck-debug-worker-update.sysconfig.example /etc/sysconfig/pyck-debug-worker-update
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pyck-debug-worker-update.timer
+#
 # Logs:
 #   journalctl -u pyck-debug-worker@test -f
 #

@@ -1,0 +1,24 @@
+# Oneshot auto-updater for pyck-debug-worker, triggered by
+# pyck-debug-worker-update.timer. Installs the newest release of the installed
+# major version, restarts the active pyck-debug-worker@ instances and rolls
+# back if they do not come up. Install steps: see pyck-debug-worker@.service.
+#
+# Logs:
+#   journalctl -u pyck-debug-worker-update
+#
+# Runs as root without sandboxing on purpose: it replaces
+# /usr/local/bin/pyck-debug-worker and stops/starts the worker units.
+
+[Unit]
+Description=pyck-debug-worker auto-update
+Documentation=https://github.com/pyck-ai/pyck-debug-worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/pyck-debug-worker-update
+
+# Optional GITHUB_TOKEN, only needed if the repo is private. Kept separate from
+# the worker's sysconfig so the token never reaches the worker.
+EnvironmentFile=-/etc/sysconfig/pyck-debug-worker-update
