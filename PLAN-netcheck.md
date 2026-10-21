@@ -136,7 +136,9 @@ Dedicated measurement target for the China → Singapore path.
 * `location = /static/netcheck/1m.bin` serves the 1 MiB file from the frontend repo
   (`apps/pyck/public/static/netcheck/1m.bin`), uncompressed (`gzip off`). Everything
   else returns 404.
-* `keepalive_time` default (1h) is fine; the worker logs it as `server-closed`.
+* `keepalive_timeout 1h` (default 75s would kill idle-survival gaps); `keepalive_time`
+  default (1h) is fine, the worker logs it as `server-closed`.
+* Config and install steps: `contrib/netcheck-host/`.
 * Open port 443 only.
 
 ## Dependencies / status
