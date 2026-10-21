@@ -39,7 +39,7 @@ The typical failure on that route is not high average latency. It is:
   exactly like real traffic, including the throughput download.
 * The host must not be Cloudflare-proxied, otherwise we measure Cloudflare.
   All `*.pyck.cloud` hosts are DNS at Cloudflare but unproxied, so any of them
-  works (`dev.pyck.cloud` → `128.140.28.237`, nginx direct).
+  works (`dev.pyck.cloud` is nginx direct).
 
 ## Measurements (per host+IP target unless noted)
 
@@ -89,7 +89,7 @@ from the 30s probe cycle.
   no auth, `json,gz,…` up to 100 MB, posts each upload to Slack. No server changes.
 * Once per day after UTC midnight, send each finished day gzipped:
   `name=<host>-netcheck-<date>.json.gz&ref=<hostname>`.
-* Success = HTTP 200 and `ok:true`; then rename to `.sent` (kept).
+* Success = HTTP 201 and `ok:true` (`Content-Length` is mandatory); then rename to `.sent` (kept).
 * Failure: retry hourly. Unsent finished days are sent at startup.
 * Each attempt prints an `ok`/`FAIL` line. Reuse the post-and-check pattern from
   `printcheck/print.go`.
