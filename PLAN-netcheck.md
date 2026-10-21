@@ -55,8 +55,29 @@ The typical failure on that route is not high average latency. It is:
 | 8 | Comparison targets (global) | TCP connect only, no data: `223.5.5.5:443` (inside China), `1.1.1.1:443` (outside). Separates "local network bad" from "border crossing bad". | 10s |
 | 9 | Persist probes | With `--netcheck`, also write each 30s `--env` probe result into the daily file. | per cycle |
 
-TLS: SNI as above, certificate not verified (only handshakes, HTTP/2 PINGs and the
-payload travel; cert checking is the `--env` probes' job).
+TLS: SNI as above. The certificate **is verified** against the system roots
+(hostname targets; a bare IP is not verified) so TLS interception is detected, see
+below. Only handshakes, HTTP/2 PINGs and the payload travel.
+
+### Interception detection
+
+A middlebox that decrypts TLS (e.g. a FortiGuard web filter on a guest network) presents
+its own certificate, so the handshake fails verification or the site's real answer is
+replaced by a block page. Every TLS connection (short, long, throughput) therefore:
+
+* verifies the chain and hostname; a failure is classified **`intercepted`** (separate
+  from timeout/refused/reset) when the handshake completes but the chain/hostname is
+  invalid. Record the leaf's SHA-256 fingerprint, issuer CN and verification error;
+* still completes the measurement on the unverified connection where useful (the
+  handshake time is real), but marks the sample as intercepted;
+* throughput: a non-200 status or a body that is not exactly the 1 MiB payload is a
+  failed measurement; additionally record the response `Server` header and a short
+  hint when the body looks like an HTML block page (e.g. contains `Web Filter`).
+
+Aggregates carry `intercepted` counts and the last seen leaf fingerprint/issuer per
+target; the first occurrence and each change of fingerprint is also an event.
+A minute with any interception is `FAIL`. The expected issuer for our VMs is Let's
+Encrypt; a different issuer is the signal.
 
 Not doing: ICMP ping (needs raw sockets; unit drops all privileges), HTTP/3.
 The uploader's ISP is derivable from the IP `debug.pyck.cloud` already records.
@@ -128,18 +149,18 @@ connection; flag validation.
 
 Dedicated measurement target for the China → Singapore path.
 
-* Small Hetzner VM in Singapore, with its own hostname, e.g. `sg-netcheck.pyck.cloud`:
-  A record at Cloudflare, unproxied. Sites run e.g. `--netcheck-hosts=sg-netcheck.pyck.cloud,<other regions>`.
-* Same setup applies to any further region VM (e.g. Japan).
-* nginx with TLS (self-signed is enough: the worker does not verify certificates;
-  Let's Encrypt optional) and HTTP/2 enabled (`listen 443 ssl; http2 on;`).
+* One small VM per region (Singapore, Tokyo, …), each with its own hostname, e.g.
+  `region-sing.pyck.cloud`, `region-japan.pyck.cloud`: A record at Cloudflare, unproxied.
+  Sites run e.g. `--netcheck-hosts=region-sing.pyck.cloud,region-japan.pyck.cloud`.
+* nginx with TLS and HTTP/2, with a real Let's Encrypt certificate (certbot, HTTP-01,
+  auto-renewed by certbot's systemd timer), so the worker can verify it.
 * `location = /static/netcheck/1m.bin` serves the 1 MiB file from the frontend repo
   (`apps/pyck/public/static/netcheck/1m.bin`), uncompressed (`gzip off`). Everything
   else returns 404.
 * `keepalive_timeout 1h` (default 75s would kill idle-survival gaps); `keepalive_time`
   default (1h) is fine, the worker logs it as `server-closed`.
 * Config and install steps: `contrib/netcheck-host/`.
-* Open port 443 only.
+* Inbound: 443 (service) and 80 (Let's Encrypt validation/renewal only: ACME path, else 404).
 
 ## Dependencies / status
 
