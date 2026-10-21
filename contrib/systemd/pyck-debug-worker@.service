@@ -39,8 +39,13 @@ RestartSec=5s
 # credentials simply gate off the auth/tenant/temporal stages.
 EnvironmentFile=-/etc/sysconfig/pyck-debug-worker
 
-# The binary never writes to disk and needs only outbound network, so it can
-# run fully sandboxed under an ephemeral, unprivileged user.
+# The binary needs only outbound network and, with --netcheck, one writable
+# directory: StateDirectory creates /var/lib/pyck-debug-worker (persistent,
+# owned by the dynamic user) and the daily files go to netcheck/ under it.
+# Everything else stays read-only and sandboxed under an ephemeral,
+# unprivileged user.
+StateDirectory=pyck-debug-worker
+WorkingDirectory=%S/pyck-debug-worker
 DynamicUser=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
