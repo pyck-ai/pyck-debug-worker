@@ -21,6 +21,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -184,25 +185,23 @@ func phaseOf(err error) string {
 // handshakePhase is the phase of a reset during a TLS handshake: hello until
 // the server sent anything, transfer after.
 func handshakePhase(conn *countConn) string {
-	if conn.read == 0 {
+	if conn.read.Load() == 0 {
 		return phaseHello
 	}
 
 	return phaseTransfer
 }
 
-// countConn counts the bytes read, to tell when during a handshake a reset
-// arrived. Only the handshaking goroutine reads it until the handshake
-// returns.
+// countConn counts the bytes read, to tell when a reset arrived.
 type countConn struct {
 	net.Conn
 
-	read int64
+	read atomic.Int64
 }
 
 func (c *countConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
-	c.read += int64(n)
+	c.read.Add(int64(n))
 
 	return n, err
 }
@@ -305,6 +304,8 @@ type shared struct {
 	store *store
 	p     *printer
 	dns   dnsChecker
+	// tput holds the one download running at a time.
+	tput chan struct{}
 }
 
 // Run measures until ctx is cancelled, then flushes and closes the day file.
@@ -328,7 +329,10 @@ func Run(ctx context.Context, cfg Config, out io.Writer) {
 
 	agg := newAgg()
 
-	sh := &shared{roots: cfg.Roots, agg: agg, store: store, p: p, dns: newDNSChecker(cfg.Roots)}
+	sh := &shared{
+		roots: cfg.Roots, agg: agg, store: store, p: p, dns: newDNSChecker(cfg.Roots),
+		tput: make(chan struct{}, 1),
+	}
 
 	var wg sync.WaitGroup
 
