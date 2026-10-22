@@ -2,7 +2,6 @@ package netcheck
 
 import (
 	"context"
-	"crypto/x509"
 	"net"
 	"net/netip"
 	"sync"
@@ -19,8 +18,10 @@ const (
 
 // resolveLoop measures every A record of host, re-resolving every
 // resolveInterval: a new IP starts being measured, a removed one stops (its
-// data is kept). A bare-IP host is a single target and is never resolved.
-func resolveLoop(ctx context.Context, host string, roots *x509.CertPool, agg *agg, store *store, p *printer) {
+// data is kept). Each resolution is followed by the DNS check. A bare-IP host
+// is a single target and is never resolved.
+func resolveLoop(ctx context.Context, host string, sh *shared) {
+	roots, agg, store, p := sh.roots, sh.agg, sh.store, sh.p
 	running := map[netip.Addr]context.CancelFunc{}
 
 	var wg sync.WaitGroup
@@ -77,6 +78,7 @@ func resolveLoop(ctx context.Context, host string, roots *x509.CertPool, agg *ag
 		started := time.Now()
 
 		ips, err := lookup(ctx, host)
+		system := systemAnswer(ips, err, time.Since(started))
 
 		switch {
 		case ctx.Err() != nil:
@@ -93,12 +95,31 @@ func resolveLoop(ctx context.Context, host string, roots *x509.CertPool, agg *ag
 			apply(ips)
 		}
 
+		dnsCheck(ctx, host, system, sh)
+
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
 	}
+}
+
+// dnsCheck compares the system answer with the DoH resolvers and records the
+// result.
+func dnsCheck(ctx context.Context, host string, system dnsAnswer, sh *shared) {
+	rec := sh.dns.check(ctx, host, system)
+	if ctx.Err() != nil {
+		return
+	}
+
+	_ = sh.store.write(rec.TS, rec)
+
+	for _, ev := range dnsEvents(rec) {
+		_ = sh.store.writeEvent(ev)
+	}
+
+	sh.p.line(rec.TS, host, "nc-dns", rec.ok(), time.Duration(system.MS*float64(time.Millisecond)), rec.detail())
 }
 
 // lookup resolves host's A records with the system resolver.

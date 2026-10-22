@@ -60,6 +60,10 @@ type event struct {
 	// the longest gap it had survived before.
 	GapS      float64 `json:"gap_s,omitempty"`
 	SurvivedS float64 `json:"survived_s,omitempty"`
+	// Resolver names the resolver of a resolver-unreachable event; Answers
+	// are every resolver's A records of a dns-mismatch event.
+	Resolver string              `json:"resolver,omitempty"`
+	Answers  map[string][]string `json:"answers,omitempty"`
 }
 
 // Event names.
@@ -70,6 +74,8 @@ const (
 	eventServerClosed = "server-closed"
 	eventResolveFail  = "resolve-failed"
 	eventIntercepted  = "intercepted"
+	eventDNSMismatch  = "dns-mismatch"
+	eventUnreachable  = "resolver-unreachable"
 )
 
 // newEvent stamps an event now.

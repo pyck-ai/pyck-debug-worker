@@ -298,6 +298,15 @@ func (p *printer) line(ts time.Time, label, stage string, ok bool, dur time.Dura
 	fmt.Fprintln(p.out, line)
 }
 
+// shared is what every host's loops share.
+type shared struct {
+	roots *x509.CertPool
+	agg   *agg
+	store *store
+	p     *printer
+	dns   dnsChecker
+}
+
 // Run measures until ctx is cancelled, then flushes and closes the day file.
 // It never returns an error: every problem is reported as a FAIL line.
 func Run(ctx context.Context, cfg Config, out io.Writer) {
@@ -319,10 +328,12 @@ func Run(ctx context.Context, cfg Config, out io.Writer) {
 
 	agg := newAgg()
 
+	sh := &shared{roots: cfg.Roots, agg: agg, store: store, p: p, dns: newDNSChecker(cfg.Roots)}
+
 	var wg sync.WaitGroup
 
 	for _, host := range cfg.Hosts {
-		wg.Go(func() { resolveLoop(ctx, host, cfg.Roots, agg, store, p) })
+		wg.Go(func() { resolveLoop(ctx, host, sh) })
 	}
 
 	if cfg.Upload {
