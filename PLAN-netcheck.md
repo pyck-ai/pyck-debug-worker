@@ -181,11 +181,11 @@ Dedicated measurement target for the China → Singapore path.
 Branch `u/max/netcheck`, `feat(netcheck)` PRs in this order:
 
 1. Core: resolver, short connections, long connections, daily files, upload,
-   systemd unit + docs.
-2. Idle survival (3) + firewall fingerprints (4).
-3. DNS check (7) + comparison targets (8).
-4. Throughput (5).
-5. Route tracing (6).
-6. Persist probes (9).
+   systemd unit + docs. — done
+2. Idle survival (3) + firewall fingerprints (4). — done
+3. DNS check (7) + comparison targets (8). — done
+4. Throughput (5). — done
+5. Route tracing (6). — done
+6. Persist probes (9). — done
 
 Verify against a local stub server and against `dev.pyck.cloud`.

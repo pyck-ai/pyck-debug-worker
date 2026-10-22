@@ -89,37 +89,84 @@ pyck-debug-worker --env test --netcheck --netcheck-hosts=region-sing.pyck.cloud,
 ```
 
 Runs beside the 30s probe cycle and never changes the exit code. Every A record
-of every host (resolved at startup and every 5 min) is one target, measured two
-ways:
+of every host (resolved at startup and every 5 min) is one target, measured
+these ways:
 
 * **short** — every 10s a fresh TCP connect + TLS handshake, then close. No
   HTTP request is sent. Records connect and handshake time; failures are
   `timeout`, `refused`, `reset`, `intercepted` or `other`; a connect taking ≈1s
-  or ≈3s counts as a lost SYN.
+  or ≈3s counts as a lost SYN. For a hostname, every other handshake sends **no
+  SNI**, and outcomes are counted per variant (`host`, `none`), so SNI-based
+  blocking shows as only the `host` variant failing. The no-SNI handshake has
+  no name to verify and is never counted as `intercepted`.
 * **long** — one HTTP/2 connection, PING every 1s. Records PING RTT, unanswered
   PINGs (5s), drops with lifetime and error, and on Linux the kernel's `TCP_INFO`
   (rtt, rttvar, retransmits). A server GOAWAY (e.g. nginx `keepalive_time`) is
   `server-closed`, not a drop. No PING answered for 30s is a drop. Reconnects
   with backoff.
+* **idle** — a third HTTP/2 connection, without TCP keepalives, pinged once and
+  then after silent gaps of 30s, 1, 2, 5, 10 and 30 min (then every 30 min).
+  Records the longest gap the connection survived and how it died: `timeout`
+  (no answer in 30s), `reset`, `other`, or `server-closed` (GOAWAY, not a
+  failure). Reconnects and starts over from 30s.
+* **throughput** — at startup and every 15 min, `GET
+  https://<host>/static/netcheck/1m.bin` over a fresh connection to the target's
+  IP, `Accept-Encoding: identity`, one download at a time across all targets.
+  Records TTFB, Mbit/s and the longest stall between reads. Anything but 200
+  with exactly 1,048,576 bytes fails (`status`, `size`); the `Server` header and,
+  for an HTML body, a short block-page hint (its title) are kept. **~100 MB/day
+  per target.**
+* **trace** (Linux only) — at startup, hourly, and when the long connection's
+  p50 RTT rises more than 30% and at least 10ms over the previous minute (at
+  most every 10 min): a `tracepath`-style trace, unprivileged (UDP probes,
+  ICMP errors from the socket's error queue), every probe to a target on the
+  same UDP flow so load-balanced paths do not look like route changes. Records every hop's IP and RTT,
+  tags the CN2 (`59.43/16`), ChinaNet (`202.97/16`), China Unicom AS4837
+  (`219.158/16`) and China Mobile (`223.120/15`) backbones, and the path MTU. A
+  hop IP different from the previous trace is a `route-changed` event. Most
+  destinations drop UDP, so `not-reached` is normal.
+
+Resets are counted by when they arrived: `hello` (before the server answered
+the ClientHello — the signature of SNI filtering), `transfer` (while data was
+flowing) and `idle` (first PING after an idle gap).
+
+Per host, after every 5-minute resolution, a **DNS check** asks AliDNS
+(`223.5.5.5`) and Cloudflare (`1.1.1.1`) over DNS-over-HTTPS (RFC 8484 GET,
+wire format, certificate verified, never via a proxy) and compares their A
+records with the system resolver's. Not done for a bare IP.
+
+Once per process, **compare** connects to `223.5.5.5:443` (inside China) and
+`1.1.1.1:443` (outside) every 10s, TCP only, to tell a bad local network from a
+bad border crossing.
 
 TLS uses the host as SNI and **verifies the certificate** for it against the
 system roots. A handshake that presents a certificate failing verification is
 `intercepted` (a TLS-inspecting middlebox, or a broken server certificate): the
 leaf's SHA-256 fingerprint, issuer CN and the verification error are recorded,
-the short connection's handshake time still counts, and the long connection is
-not used for PINGs. A bare-IP entry has no name to verify: no SNI, no
-verification. Hosts must not be Cloudflare-proxied.
+the short connection's handshake time still counts, and the long and idle
+connections are not used for PINGs. The throughput download goes ahead on an
+intercepted connection, so a block page behind it is seen, but fails. A bare-IP
+entry has no name to verify: no SNI, no verification, `Host` is the IP. Hosts
+must not be Cloudflare-proxied.
 
 `--netcheck-hosts` takes bare hostnames; a bare IP works too. URLs, ports,
 empty entries and duplicates are refused (exit 2), as are `--netcheck-hosts`
 and `--netcheck-upload` without `--netcheck`.
 
-Every minute, one line per target and mode; `FAIL` on any loss, failure
-(including `intercepted`) or drop:
+Every minute, one line per target and mode (`nc-short`, `nc-long`, `nc-idle`)
+and per comparison target (`nc-compare`); `FAIL` on any loss, failure
+(including `intercepted`) or drop. Throughput, trace and DNS check print one
+line each time they run (`nc-tput`, `nc-trace`, `nc-dns`):
 
 ```
-2026-10-21T10:01:00Z  dev.pyck.cloud/192.0.2.10  nc-short     ok      14ms  n=6 lost=0  connect min/p50/p95/p99/max 13.8/14.1/15.0/15.0/15.0ms jitter 0.4ms  tls min/p50/p95/p99/max …
-2026-10-21T10:01:00Z  dev.pyck.cloud/192.0.2.10  nc-long      ok      14ms  n=60 lost=0 drops=0  rtt min/p50/p95/p99/max …  tcp rtt 14.2ms rttvar 0.6ms retrans 0
+2026-10-22T07:10:00Z  dev.pyck.cloud/192.0.2.10  nc-short     ok      49ms  n=6 lost=0  sni ok host 3/3 none 3/3  connect min/p50/p95/p99/max 42.6/48.8/56.9/56.9/56.9ms jitter 4.9ms  tls min/p50/p95/p99/max …
+2026-10-22T07:10:00Z  dev.pyck.cloud/192.0.2.10  nc-long      ok      57ms  n=60 lost=0 drops=0  rtt min/p50/p95/p99/max …  tcp rtt 53.0ms rttvar 7.6ms retrans 3
+2026-10-22T07:10:00Z  dev.pyck.cloud/192.0.2.10  nc-idle      ok      48ms  n=1 lost=0 drops=0  rtt min/p50/p95/p99/max …  survived 60s
+2026-10-22T07:12:00Z  dev.pyck.cloud/192.0.2.10  nc-idle      ok      47ms  n=2 lost=0 drops=0 server-closed=1  rtt min/p50/p95/p99/max …  survived 30s  died after 120s gap: server-closed (had survived 60s)
+2026-10-22T07:10:00Z  alidns/223.5.5.5           nc-compare    ok      54ms  n=6 lost=0  connect min/p50/p95/p99/max 51.8/54.5/65.1/65.1/65.1ms jitter 5.2ms
+2026-10-22T07:08:47Z  dev.pyck.cloud             nc-dns       ok     140ms  system 192.0.2.10 139.6ms  alidns 192.0.2.10 342.1ms  cloudflare 192.0.2.10 342.5ms
+2026-10-22T07:08:47Z  dev.pyck.cloud/192.0.2.10  nc-tput      ok     1.49s  status 200 HTTP/2.0  1048576 B 7.25 Mbit/s  connect 73.9ms tls 111.1ms ttfb 144.1ms stall 185.1ms  server "nginx"
+2026-10-22T07:08:47Z  dev.pyck.cloud/192.0.2.10  nc-trace     ok    24.63s  startup  hops=14  reached  pmtu=1280
 ```
 
 ### Files
@@ -127,16 +174,37 @@ Every minute, one line per target and mode; `FAIL` on any loss, failure
 **This writes to disk.** One file per UTC day under the working directory,
 `netcheck/YYYY-MM-DD.json`, JSON lines, appended and flushed every minute (a
 restart loses at most a minute and resumes the same file). Nothing is ever
-deleted. ~1–2 MB/day.
+deleted. A few MB/day, mostly route traces and probe results.
 
 * `{"type":"header",…}` — first line: version, hostname, OS, the netcheck flags.
-* `{"type":"agg",…}` — per minute, target (`host`, `ip`) and `mode`: `samples`,
-  `losses`, `connect`/`tls` (short) or `rtt` (long) as min/p50/p95/p99/max/jitter
-  in ms, `failures` by class, `drops`, `server_closed`, `tcp` (Linux), and
-  `intercepted_cert` (last `fingerprint`, `issuer`, `error` of the minute).
+* `{"type":"agg",…}` — per minute, target (`host`, `ip`) and `mode` (`short`,
+  `long`, `idle`, `compare`): `samples`, `losses`, `connect`/`tls` (short,
+  compare) or `rtt` (long, idle) as min/p50/p95/p99/max/jitter in ms, `failures`
+  by class, `drops`, `server_closed`, `tcp` (Linux), `intercepted_cert` (last
+  `fingerprint`, `issuer`, `error` of the minute), `resets` by phase, `sni`
+  (short: `host`/`none` → `samples`, `failures`), and `idle` (`survived_s`, the
+  longest gap the current connection survived; `died`: `gap_s`, `survived_s`,
+  `how`). Comparison targets have `host` `alidns` or `cloudflare`.
+* `{"type":"throughput",…}` — per download: `ok`, `status`, `proto`, `bytes`,
+  `connect_ms`, `tls_ms`, `ttfb_ms` (request written → first byte), `body_ms`,
+  `mbit_s`, `stall_ms`, `server`, `block_hint`, `class`/`phase`/`error` when it
+  failed, `intercepted_cert`.
+* `{"type":"trace",…}` — per trace: `reason` (`startup`, `hourly`,
+  `latency-jump`), `hops` (`ttl`, `ip`, `rtt_ms`, `carrier`; no `ip` for a silent
+  TTL), `reached`, `pmtu`, `duration_ms`, `route_changed`, `error`.
+* `{"type":"dns",…}` — per host and check: `answers` (`resolver` `system`,
+  `alidns` or `cloudflare`, `ms`, sorted `ips`, `nxdomain`, or `error`/`class`
+  when it could not be asked), `mismatch`, `unreachable`.
+* `{"type":"probe",…}` — every `--env` probe stage result: `ts`, `target`,
+  `stage`, `ok`, `duration_ms`, `detail` — the printed line, which never carries
+  a secret.
 * `{"type":"event",…}` — `ip-added`, `ip-removed`, `drop`, `server-closed`
-  (with `lifetime_s`, `error`), `resolve-failed`, `intercepted` (first time per
-  target and on every fingerprint change, with `fingerprint`, `issuer`, `error`).
+  (with `mode`, `lifetime_s`, `error`; a drop's `class` and a reset's `phase`;
+  for `idle` also `gap_s` and `survived_s`, absent meaning 0),
+  `resolve-failed`, `intercepted` (first time per target and on every
+  fingerprint change, with `fingerprint`, `issuer`, `error`), `dns-mismatch`
+  (`answers` per resolver), `resolver-unreachable` (`resolver`, `class`,
+  `error`), `route-changed` (`path`, `prev_path`, `*` for a silent TTL).
 
 ### Upload (`--netcheck-upload`)
 
@@ -145,8 +213,8 @@ finished day is gzipped and posted to `https://debug.pyck.cloud/upload` as
 `<hostname>-netcheck-<date>.json.gz`, `ref=<hostname>`. On success (HTTP 201)
 the file is renamed to `.json.sent` and kept; on failure it is retried hourly.
 Each attempt prints an `ok`/`FAIL` line. What leaves the machine: the file
-above (this machine's hostname and measurements) and, as for any request, its
-public IP. Each upload is posted to pyck's Slack.
+above (this machine's hostname, measurements and probe results) and, as for any
+request, its public IP. Each upload is posted to pyck's Slack.
 
 ### Docker
 
