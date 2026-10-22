@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG GO_VERSION=1.26
+ARG GO_VERSION=1.27
 
 FROM --platform=$BUILDPLATFORM ghcr.io/pyck-ai/baseimages/golang:${GO_VERSION}-alpine AS build
 
