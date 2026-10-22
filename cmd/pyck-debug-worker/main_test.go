@@ -6,6 +6,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/pyck-ai/pyck-debug-worker/internal/netcheck"
+	"github.com/pyck-ai/pyck-debug-worker/internal/report"
 )
 
 func TestNetcheckFlagsRefused(t *testing.T) {
@@ -66,5 +70,36 @@ func TestNetcheckFlagsAccepted(t *testing.T) {
 				t.Errorf("got netcheck=%v upload=%v hosts=%v", cfg.netcheck, cfg.netcheckUpload, cfg.netcheckHosts)
 			}
 		})
+	}
+}
+
+func TestPersistProbes(t *testing.T) {
+	results := []report.Result{{Target: "dev.pyck.cloud:443", Stage: "tls", OK: true}}
+
+	// Netcheck off: nothing to hand over, nothing happens.
+	persistProbes(nil, results)
+	persistProbes(&netcheck.Config{}, results)
+
+	nc := &netcheck.Config{Probes: make(chan []report.Result, 1)}
+	persistProbes(nc, results)
+
+	if got := <-nc.Probes; len(got) != 1 || got[0].Stage != "tls" {
+		t.Errorf("handed over %v", got)
+	}
+
+	// A full queue drops the cycle instead of blocking the probe loop.
+	nc.Probes <- results
+
+	done := make(chan struct{})
+
+	go func() {
+		persistProbes(nc, results)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("persistProbes blocked on a full queue")
 	}
 }

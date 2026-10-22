@@ -54,6 +54,9 @@ type Config struct {
 	// Roots are the trust anchors hostname targets are verified against. Nil
 	// means the system roots; tests inject their own pool.
 	Roots *x509.CertPool
+	// Probes, if set, carries each --env probe cycle's results; every
+	// result is written to the day file as a probe record.
+	Probes chan []report.Result
 }
 
 // ParseHosts validates a comma-separated --netcheck-hosts value. Full URLs,
@@ -350,6 +353,10 @@ func Run(ctx context.Context, cfg Config, out io.Writer) {
 
 	if cfg.Upload {
 		wg.Go(func() { uploadLoop(ctx, store, hostname, p) })
+	}
+
+	if cfg.Probes != nil {
+		wg.Go(func() { probeLoop(ctx, cfg.Probes, store) })
 	}
 
 	minuteLoop(ctx, sh)

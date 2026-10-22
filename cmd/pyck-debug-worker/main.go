@@ -57,6 +57,8 @@ const (
 	hardcodedDeep = true
 	// maxConcurrentTargets bounds how many targets are probed at once.
 	maxConcurrentTargets = 8
+	// probeQueue is how many cycles may wait to be written by netcheck.
+	probeQueue = 4
 )
 
 // Environment variables read for credentials and identity. Secrets never come
@@ -152,6 +154,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			Upload:  cfg.netcheckUpload,
 			Dir:     netcheck.Dir,
 			Version: buildinfo.String(),
+			Probes:  make(chan []report.Result, probeQueue),
 		}
 
 		netcheckBanner(stdout, *nc)
@@ -504,6 +507,7 @@ func loop(
 		})
 
 		fmt.Fprintln(out, run.Add(probed))
+		persistProbes(nc, probed.Results)
 
 		// Once, after the first cycle and before the first tick. Never inside
 		// the loop: every run of this puts a page in a physical output tray.
@@ -534,6 +538,20 @@ func loop(
 	}
 
 	return exitOK
+}
+
+// persistProbes hands a cycle's results to netcheck, which writes them into
+// its day file. It never blocks the probe cycle: should netcheck fall that
+// far behind, the cycle is dropped from the file (stdout has it).
+func persistProbes(nc *netcheck.Config, results []report.Result) {
+	if nc == nil || nc.Probes == nil {
+		return
+	}
+
+	select {
+	case nc.Probes <- results:
+	default:
+	}
 }
 
 // printOnce prints a QR label for the first cycle's own output and reports
