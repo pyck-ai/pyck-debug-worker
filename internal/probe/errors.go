@@ -117,7 +117,7 @@ func grpcReason(err error) (string, bool) {
 	case codes.Unauthenticated:
 		return "unauthenticated: bad API key", true
 	case codes.PermissionDenied:
-		// PLAN reads this as "valid identity, wrong scope", but the live pyck
+		// gRPC defines this as "valid identity, wrong scope", but the live pyck
 		// frontend also answers PermissionDenied for a plainly invalid key,
 		// so the verdict must not vouch for the identity.
 		return "permission denied: not authorised for this namespace (rejected key or wrong scope)", true
