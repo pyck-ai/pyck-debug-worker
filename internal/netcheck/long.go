@@ -86,10 +86,13 @@ func longLoop(ctx context.Context, t Target, agg *agg, store *store) {
 // dialLong connects, handshakes with ALPN h2 and starts an HTTP/2 client
 // connection.
 func dialLong(ctx context.Context, t Target) (*longConn, error) {
+	return dialH2(ctx, t, net.Dialer{})
+}
+
+// dialH2 is dialLong with the given dialer.
+func dialH2(ctx context.Context, t Target, dialer net.Dialer) (*longConn, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
-
-	var dialer net.Dialer
 
 	conn, err := dialer.DialContext(dialCtx, "tcp", t.addr())
 	if err != nil {
@@ -157,7 +160,7 @@ func session(ctx context.Context, t Target, conn *longConn, agg *agg) (event, bo
 			return event{}, false
 		case <-ticker.C:
 			if time.Since(lastAnswer) > deadAfter {
-				return ended(t, started, conn, fmt.Errorf("%w for %s", errNoAnswer, deadAfter), agg), true
+				return ended(t, modeLong, started, conn, fmt.Errorf("%w for %s", errNoAnswer, deadAfter), agg), true
 			}
 
 			go ping(ctx, conn.cc, results)
@@ -170,13 +173,13 @@ func session(ctx context.Context, t Target, conn *longConn, agg *agg) (event, bo
 			switch {
 			case r.err == nil:
 				lastAnswer = time.Now()
-				agg.ping(t, r.rtt)
+				agg.ping(t, modeLong, r.rtt)
 			case ctx.Err() != nil:
 				return event{}, false
 			case errors.Is(r.err, context.DeadlineExceeded):
-				agg.lostPing(t)
+				agg.lostPing(t, modeLong)
 			default:
-				return ended(t, started, conn, r.err, agg), true
+				return ended(t, modeLong, started, conn, r.err, agg), true
 			}
 		}
 	}
@@ -193,25 +196,39 @@ func ping(ctx context.Context, cc *http2.ClientConn, results chan<- pingResult) 
 	results <- pingResult{rtt: time.Since(started), err: err}
 }
 
-// ended records the end of a connection. A connection the server sent GOAWAY
-// on (nginx keepalive_time, a reload) is server-closed, not a drop.
-func ended(t Target, started time.Time, conn *longConn, err error, agg *agg) event {
+// ended records the end of a long or idle connection. A connection the
+// server sent GOAWAY on (nginx keepalive_time, a reload) is server-closed, not
+// a drop.
+func ended(t Target, mode string, started time.Time, conn *longConn, err error, agg *agg) event {
 	name := eventDrop
 
 	// Closing without our own Close or Shutdown means a GOAWAY arrived.
 	if st := conn.cc.State(); st.Closing && !errors.Is(err, errNoAnswer) {
 		name = eventServerClosed
-		agg.serverClosed(t)
+		agg.serverClosed(t, mode)
 	} else {
-		agg.drop(t)
+		agg.drop(t, mode)
 	}
 
 	ev := newEvent(name, t)
-	ev.Mode = modeLong
+	ev.Mode = mode
 	ev.LifetimeS = round(time.Since(started).Seconds())
 	ev.Error = err.Error()
 
+	if name == eventDrop {
+		ev.Class = dropClass(err)
+	}
+
 	return ev
+}
+
+// dropClass is how a connection died: unanswered PINGs are a timeout.
+func dropClass(err error) string {
+	if errors.Is(err, errNoAnswer) {
+		return classTimeout
+	}
+
+	return classify(err)
 }
 
 // sleep waits d, reporting false if ctx ended first.

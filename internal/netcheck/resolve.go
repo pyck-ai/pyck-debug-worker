@@ -46,6 +46,7 @@ func resolveLoop(ctx context.Context, host string, roots *x509.CertPool, agg *ag
 
 			wg.Go(func() { shortLoop(tctx, t, agg, store) })
 			wg.Go(func() { longLoop(tctx, t, agg, store) })
+			wg.Go(func() { idleLoop(tctx, t, agg, store) })
 		}
 
 		for ip, cancel := range running {

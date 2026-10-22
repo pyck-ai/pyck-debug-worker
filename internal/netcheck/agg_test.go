@@ -83,16 +83,16 @@ func TestAggFlush(t *testing.T) {
 	a.short(testTarget, 10*time.Millisecond, 20*time.Millisecond, 0)
 	a.short(testTarget, 1100*time.Millisecond, 30*time.Millisecond, 1)
 	a.fail(testTarget, modeShort, classReset)
-	a.ping(testTarget, 5*time.Millisecond)
-	a.ping(testTarget, 7*time.Millisecond)
-	a.lostPing(testTarget)
-	a.serverClosed(testTarget)
+	a.ping(testTarget, modeLong, 5*time.Millisecond)
+	a.ping(testTarget, modeLong, 7*time.Millisecond)
+	a.lostPing(testTarget, modeLong)
+	a.serverClosed(testTarget, modeLong)
 	a.tcpInfo(testTarget, tcpInfo{RTT: 6 * time.Millisecond, RTTVar: time.Millisecond}, 2)
 	a.tcpInfo(testTarget, tcpInfo{RTT: 8 * time.Millisecond, RTTVar: 2 * time.Millisecond}, 1)
 
 	got := a.flush(testMinute)
-	if len(got) != 2 {
-		t.Fatalf("flush returned %d aggregates, want 2 (short, long)", len(got))
+	if len(got) != 3 {
+		t.Fatalf("flush returned %d aggregates, want 3 (short, long, idle)", len(got))
 	}
 
 	short, long := got[0], got[1]
@@ -118,7 +118,7 @@ func TestAggFlush(t *testing.T) {
 
 	// The next minute starts empty and clean.
 	next := a.flush(testMinute.Add(time.Minute))
-	if len(next) != 2 || next[0].Samples != 0 || next[1].Samples != 0 || !next[0].ok() || !next[1].ok() {
+	if len(next) != 3 || next[0].Samples != 0 || next[1].Samples != 0 || !next[0].ok() || !next[1].ok() {
 		t.Errorf("second flush not reset: %+v", next)
 	}
 }
@@ -148,11 +148,11 @@ func TestAggOK(t *testing.T) {
 func TestAggUnregisterKeepsLastMinute(t *testing.T) {
 	a := newAgg()
 	a.register(testTarget)
-	a.ping(testTarget, time.Millisecond)
+	a.ping(testTarget, modeLong, time.Millisecond)
 	a.unregister(testTarget)
 
 	got := a.flush(testMinute)
-	if len(got) != 2 || got[1].Samples != 1 {
+	if len(got) != 3 || got[1].Samples != 1 {
 		t.Fatalf("last minute of a removed target lost: %+v", got)
 	}
 
@@ -161,7 +161,7 @@ func TestAggUnregisterKeepsLastMinute(t *testing.T) {
 	}
 
 	// Samples for an unregistered target are ignored.
-	a.ping(testTarget, time.Millisecond)
+	a.ping(testTarget, modeLong, time.Millisecond)
 
 	if again := a.flush(testMinute.Add(2 * time.Minute)); len(again) != 0 {
 		t.Errorf("unregistered target collected samples: %+v", again)
@@ -171,8 +171,8 @@ func TestAggUnregisterKeepsLastMinute(t *testing.T) {
 func TestAggregateLine(t *testing.T) {
 	a := newAgg()
 	a.register(testTarget)
-	a.ping(testTarget, 12*time.Millisecond)
-	a.drop(testTarget)
+	a.ping(testTarget, modeLong, 12*time.Millisecond)
+	a.drop(testTarget, modeLong)
 	a.fail(testTarget, modeLong, classRefused)
 
 	long := a.flush(testMinute)[1]

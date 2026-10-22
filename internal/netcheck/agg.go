@@ -5,6 +5,7 @@ import (
 	"math"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,10 +15,11 @@ import (
 const (
 	modeShort = "short"
 	modeLong  = "long"
+	modeIdle  = "idle"
 )
 
 // modes is the per-target emission order.
-var modes = []string{modeShort, modeLong}
+var modes = []string{modeShort, modeLong, modeIdle}
 
 // stats summarises one minute of latency samples, in milliseconds.
 type stats struct {
@@ -44,6 +46,25 @@ type certInfo struct {
 	Error       string `json:"error"`
 }
 
+// idleStats is the idle connection at the end of the minute.
+type idleStats struct {
+	// SurvivedS is the longest gap the current connection survived.
+	SurvivedS float64 `json:"survived_s"`
+	// Died is the minute's last idle connection death, if any.
+	Died *idleDeath `json:"died,omitempty"`
+}
+
+// idleDeath is how an idle connection ended.
+type idleDeath struct {
+	// GapS is the gap after which the PING failed; 0 is the first PING
+	// right after connecting.
+	GapS float64 `json:"gap_s"`
+	// SurvivedS is the longest gap the connection had survived before.
+	SurvivedS float64 `json:"survived_s"`
+	// How is timeout, reset, other or server-closed.
+	How string `json:"how"`
+}
+
 // aggregate is one minute of one mode for one target.
 //
 // samples are connection attempts (short) or answered plus unanswered pings
@@ -67,6 +88,8 @@ type aggregate struct {
 	// Cert is the last intercepted certificate seen this minute; the count
 	// is failures["intercepted"].
 	Cert *certInfo `json:"intercepted_cert,omitempty"`
+	// Idle is set for the idle mode.
+	Idle *idleStats `json:"idle,omitempty"`
 
 	target Target
 }
@@ -110,7 +133,7 @@ func (a aggregate) duration() time.Duration {
 func (a aggregate) detail() string {
 	parts := []string{fmt.Sprintf("n=%d lost=%d", a.Samples, a.Losses)}
 
-	if a.Mode == modeLong {
+	if a.Mode == modeLong || a.Mode == modeIdle {
 		parts[0] += fmt.Sprintf(" drops=%d", a.Drops)
 
 		if a.ServerClosed > 0 {
@@ -138,6 +161,15 @@ func (a aggregate) detail() string {
 		}
 	}
 
+	if a.Idle != nil {
+		parts = append(parts, fmt.Sprintf("survived %ss", formatSeconds(a.Idle.SurvivedS)))
+
+		if d := a.Idle.Died; d != nil {
+			parts = append(parts, fmt.Sprintf("died after %ss gap: %s (had survived %ss)",
+				formatSeconds(d.GapS), d.How, formatSeconds(d.SurvivedS)))
+		}
+	}
+
 	if a.Cert != nil {
 		parts = append(parts, fmt.Sprintf("intercepted issuer %q sha256 %.16s…", a.Cert.Issuer, a.Cert.Fingerprint))
 	}
@@ -148,6 +180,11 @@ func (a aggregate) detail() string {
 	}
 
 	return strings.Join(parts, "  ")
+}
+
+// formatSeconds renders whole seconds without a fraction.
+func formatSeconds(s float64) string {
+	return strconv.FormatFloat(s, 'f', -1, 64)
 }
 
 // bucket accumulates one minute of one mode for one target.
@@ -162,6 +199,7 @@ type bucket struct {
 	serverClosed int
 	tcp          *tcpStats
 	cert         *certInfo
+	died         *idleDeath
 }
 
 // bucketKey identifies a bucket.
@@ -179,10 +217,18 @@ type agg struct {
 	// lastFP is the last intercepted fingerprint per target, across minutes
 	// and modes, so only a first occurrence or a change becomes an event.
 	lastFP map[Target]string
+	// survived is the longest gap each target's current idle connection
+	// survived, across minutes.
+	survived map[Target]float64
 }
 
 func newAgg() *agg {
-	return &agg{removed: map[Target]bool{}, buckets: map[bucketKey]*bucket{}, lastFP: map[Target]string{}}
+	return &agg{
+		removed:  map[Target]bool{},
+		buckets:  map[bucketKey]*bucket{},
+		lastFP:   map[Target]string{},
+		survived: map[Target]float64{},
+	}
 }
 
 // register starts collecting for t.
@@ -274,30 +320,47 @@ func (a *agg) short(t Target, connect, handshake time.Duration, synRetrans int) 
 	})
 }
 
-// ping records one answered PING.
-func (a *agg) ping(t Target, rtt time.Duration) {
-	a.with(t, modeLong, func(b *bucket) {
+// ping records one answered PING on the long or idle connection.
+func (a *agg) ping(t Target, mode string, rtt time.Duration) {
+	a.with(t, mode, func(b *bucket) {
 		b.samples++
 		b.rtt = append(b.rtt, ms(rtt))
 	})
 }
 
-// lostPing records one unanswered PING.
-func (a *agg) lostPing(t Target) {
-	a.with(t, modeLong, func(b *bucket) {
+// lostPing records one unanswered PING on the long or idle connection.
+func (a *agg) lostPing(t Target, mode string) {
+	a.with(t, mode, func(b *bucket) {
 		b.samples++
 		b.losses++
 	})
 }
 
-// drop records the long connection dying.
-func (a *agg) drop(t Target) {
-	a.with(t, modeLong, func(b *bucket) { b.drops++ })
+// drop records the long or idle connection dying.
+func (a *agg) drop(t Target, mode string) {
+	a.with(t, mode, func(b *bucket) { b.drops++ })
 }
 
-// serverClosed records the server closing the long connection on purpose.
-func (a *agg) serverClosed(t Target) {
-	a.with(t, modeLong, func(b *bucket) { b.serverClosed++ })
+// serverClosed records the server closing the long or idle connection on
+// purpose.
+func (a *agg) serverClosed(t Target, mode string) {
+	a.with(t, mode, func(b *bucket) { b.serverClosed++ })
+}
+
+// idleSurvived sets the longest gap t's current idle connection survived; 0
+// starts a new connection.
+func (a *agg) idleSurvived(t Target, gap time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if _, ok := a.buckets[bucketKey{t, modeIdle}]; ok {
+		a.survived[t] = gap.Seconds()
+	}
+}
+
+// idleDied records how t's idle connection ended.
+func (a *agg) idleDied(t Target, d idleDeath) {
+	a.with(t, modeIdle, func(b *bucket) { b.died = &d })
 }
 
 // tcpInfo records a TCP_INFO reading and the retransmits since the last one.
@@ -326,7 +389,13 @@ func (a *agg) flush(minute time.Time) []aggregate {
 	for _, t := range a.targets {
 		for _, mode := range modes {
 			key := bucketKey{t, mode}
-			out = append(out, a.buckets[key].aggregate(minute, t, mode))
+			rec := a.buckets[key].aggregate(minute, t, mode)
+
+			if mode == modeIdle {
+				rec.Idle = &idleStats{SurvivedS: a.survived[t], Died: a.buckets[key].died}
+			}
+
+			out = append(out, rec)
 			a.buckets[key] = &bucket{}
 		}
 
@@ -338,6 +407,7 @@ func (a *agg) flush(minute time.Time) []aggregate {
 			}
 
 			delete(a.lastFP, t)
+			delete(a.survived, t)
 
 			continue
 		}
