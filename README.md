@@ -174,7 +174,8 @@ line each time they run (`nc-tput`, `nc-trace`, `nc-dns`):
 **This writes to disk.** One file per UTC day under the working directory,
 `netcheck/YYYY-MM-DD.json`, JSON lines, appended and flushed every minute (a
 restart loses at most a minute and resumes the same file). Nothing is ever
-deleted. A few MB/day, mostly route traces and probe results.
+deleted. Measured with three hosts and `--env test`: ~15 MB/day (more than half
+of it probe results), ~1.7 MB/day gzipped as uploaded.
 
 * `{"type":"header",…}` — first line: version, hostname, OS, the netcheck flags.
 * `{"type":"agg",…}` — per minute, target (`host`, `ip`) and `mode` (`short`,
