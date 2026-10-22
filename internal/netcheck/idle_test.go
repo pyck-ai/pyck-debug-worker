@@ -85,8 +85,8 @@ func TestIdleSession(t *testing.T) {
 			t.Errorf("idle = %+v, want died %+v and the survived gap reset", idle.Idle, want)
 		}
 
-		if idle.Drops != 1 || idle.ok() {
-			t.Errorf("aggregate = %+v, want one drop, FAIL", idle)
+		if idle.Drops != 1 || idle.ok() || idle.Resets[phaseIdle] != 1 || ev.Phase != phaseIdle {
+			t.Errorf("aggregate = %+v event phase %q, want one drop in the idle phase, FAIL", idle, ev.Phase)
 		}
 
 		if d := idle.detail(); !strings.Contains(d, "died after 0.04s gap: reset (had survived 0.02s)") {

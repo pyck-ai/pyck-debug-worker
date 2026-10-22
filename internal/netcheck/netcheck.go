@@ -141,6 +141,72 @@ const (
 	classIntercepted = "intercepted"
 )
 
+// Reset phases: when a connection reset arrived.
+const (
+	// phaseHello is a reset before the server answered our ClientHello with
+	// a single byte: the signature of SNI-based blocking.
+	phaseHello = "hello"
+	// phaseTransfer is a reset while data was flowing: later in the
+	// handshake, between PINGs every second, or during a download.
+	phaseTransfer = "transfer"
+	// phaseIdle is a reset seen on the first PING after an idle gap.
+	phaseIdle = "idle"
+)
+
+// resetError is a connection reset with the phase it arrived in.
+type resetError struct {
+	phase string
+	err   error
+}
+
+func (e *resetError) Error() string { return e.err.Error() }
+func (e *resetError) Unwrap() error { return e.err }
+
+// withPhase tags err with phase if it is a reset.
+func withPhase(err error, phase string) error {
+	if classify(err) != classReset {
+		return err
+	}
+
+	return &resetError{phase: phase, err: err}
+}
+
+// phaseOf is the phase a reset error was tagged with, or "".
+func phaseOf(err error) string {
+	var re *resetError
+	if errors.As(err, &re) {
+		return re.phase
+	}
+
+	return ""
+}
+
+// handshakePhase is the phase of a reset during a TLS handshake: hello until
+// the server sent anything, transfer after.
+func handshakePhase(conn *countConn) string {
+	if conn.read == 0 {
+		return phaseHello
+	}
+
+	return phaseTransfer
+}
+
+// countConn counts the bytes read, to tell when during a handshake a reset
+// arrived. Only the handshaking goroutine reads it until the handshake
+// returns.
+type countConn struct {
+	net.Conn
+
+	read int64
+}
+
+func (c *countConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.read += int64(n)
+
+	return n, err
+}
+
 // interception describes the certificate that failed verification.
 type interception struct {
 	Fingerprint string // hex SHA-256 of the leaf

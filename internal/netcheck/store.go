@@ -52,8 +52,10 @@ type event struct {
 	Fingerprint string `json:"fingerprint,omitempty"`
 	Issuer      string `json:"issuer,omitempty"`
 	Error       string `json:"error,omitempty"`
-	// Class is how a dropped connection died (timeout, reset, other).
+	// Class is how a dropped connection died (timeout, reset, other), Phase
+	// when a reset arrived (hello, transfer, idle).
 	Class string `json:"class,omitempty"`
+	Phase string `json:"phase,omitempty"`
 	// GapS is the idle gap after which an idle connection died, SurvivedS
 	// the longest gap it had survived before.
 	GapS      float64 `json:"gap_s,omitempty"`

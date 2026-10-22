@@ -31,11 +31,7 @@ func idleLoop(ctx context.Context, t Target, agg *agg, store *store) {
 				return
 			}
 
-			if info, ok := interceptionOf(err); ok {
-				noteInterception(agg, store, t, modeIdle, info)
-			} else {
-				agg.fail(t, modeIdle, classify(err))
-			}
+			noteFailure(agg, store, t, modeIdle, err)
 
 			if !sleep(ctx, backoff) {
 				return
@@ -76,7 +72,13 @@ func idleSession(ctx context.Context, t Target, conn *longConn, agg *agg) (event
 		case ctx.Err() != nil:
 			return event{}, false
 		case err != nil:
-			ev := ended(t, modeIdle, started, conn, err, agg)
+			// The first PING follows the handshake directly: not idle yet.
+			phase := phaseIdle
+			if gap == 0 {
+				phase = phaseTransfer
+			}
+
+			ev := ended(t, modeIdle, phase, started, conn, err, agg)
 			ev.GapS = gap.Seconds()
 			ev.SurvivedS = survived.Seconds()
 

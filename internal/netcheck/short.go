@@ -28,18 +28,36 @@ type shortResult struct {
 	err   error
 	// icpt is set when class is intercepted.
 	icpt interception
+	// phase is set when class is reset.
+	phase string
 }
 
 // shortLoop opens a short connection every shortInterval until ctx ends.
+// A hostname target alternates between sending the host as SNI and sending
+// none, so SNI-based blocking shows as only one variant failing.
 func shortLoop(ctx context.Context, t Target, agg *agg, store *store) {
 	ticker := time.NewTicker(shortInterval)
 	defer ticker.Stop()
 
-	for {
-		r := shortOnce(ctx, t)
+	for i := 0; ; i++ {
+		withSNI := sendSNI(t, i)
+		r := shortOnce(ctx, t, withSNI)
 
 		if ctx.Err() != nil {
 			return
+		}
+
+		if !t.bareIP() {
+			variant := sniHost
+			if !withSNI {
+				variant = sniNone
+			}
+
+			agg.sni(t, variant, r.class)
+		}
+
+		if r.class == classReset {
+			agg.reset(t, modeShort, r.phase)
 		}
 
 		switch r.class {
@@ -61,9 +79,16 @@ func shortLoop(ctx context.Context, t Target, agg *agg, store *store) {
 	}
 }
 
+// sendSNI reports whether the i-th short connection to t sends SNI: every
+// other one for a hostname, never for a bare IP.
+func sendSNI(t Target, i int) bool {
+	return !t.bareIP() && i%2 == 0
+}
+
 // shortOnce connects, completes a TLS handshake and closes. No HTTP request
-// is sent, so nothing reaches the server's access log.
-func shortOnce(ctx context.Context, t Target) shortResult {
+// is sent, so nothing reaches the server's access log. Without withSNI the
+// handshake sends no SNI and, having no name to check, verifies nothing.
+func shortOnce(ctx context.Context, t Target, withSNI bool) shortResult {
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 
@@ -80,17 +105,25 @@ func shortOnce(ctx context.Context, t Target) shortResult {
 
 	defer conn.Close()
 
-	tlsConn := tls.Client(conn, tlsConfig(t, "h2", "http/1.1"))
+	cfg := tlsConfig(t, "h2", "http/1.1")
+	if !withSNI {
+		cfg = unverifiedTLS("h2", "http/1.1")
+	}
+
+	counted := &countConn{Conn: conn}
+	tlsConn := tls.Client(counted, cfg)
 
 	started = time.Now()
 	err = tlsConn.HandshakeContext(ctx)
 	handshake := time.Since(started)
 
 	if err != nil {
-		err = wrapHandshake(err)
+		err = withPhase(wrapHandshake(err), handshakePhase(counted))
 		info, _ := interceptionOf(err)
 
-		return shortResult{connect: connect, handshake: handshake, class: classify(err), err: err, icpt: info}
+		return shortResult{
+			connect: connect, handshake: handshake, class: classify(err), err: err, icpt: info, phase: phaseOf(err),
+		}
 	}
 
 	return shortResult{connect: connect, handshake: handshake}
@@ -115,11 +148,7 @@ func synRetrans(connect time.Duration) int {
 // no verification.
 func tlsConfig(t Target, alpn ...string) *tls.Config {
 	if t.bareIP() {
-		return &tls.Config{
-			NextProtos:         alpn,
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: true, //nolint:gosec // a bare IP has no name to verify
-		}
+		return unverifiedTLS(alpn...)
 	}
 
 	return &tls.Config{
@@ -127,6 +156,32 @@ func tlsConfig(t Target, alpn ...string) *tls.Config {
 		RootCAs:    t.roots,
 		NextProtos: alpn,
 		MinVersion: tls.VersionTLS12,
+	}
+}
+
+// unverifiedTLS sends no SNI and verifies nothing: without a name there is
+// nothing to verify the certificate against.
+func unverifiedTLS(alpn ...string) *tls.Config {
+	return &tls.Config{
+		NextProtos:         alpn,
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true, //nolint:gosec // no name to verify against
+	}
+}
+
+// noteFailure records a failed long or idle dial: an interception, or a
+// failure class plus, for a reset, its phase.
+func noteFailure(agg *agg, store *store, t Target, mode string, err error) {
+	if info, ok := interceptionOf(err); ok {
+		noteInterception(agg, store, t, mode, info)
+
+		return
+	}
+
+	agg.fail(t, mode, classify(err))
+
+	if phase := phaseOf(err); phase != "" {
+		agg.reset(t, mode, phase)
 	}
 }
 

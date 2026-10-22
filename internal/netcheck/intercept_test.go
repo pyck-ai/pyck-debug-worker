@@ -42,7 +42,7 @@ func TestShortIntercepted(t *testing.T) {
 	t.Run("untrusted chain", func(t *testing.T) {
 		target, fingerprint := selfSigned(t, "example.com")
 
-		r := shortOnce(context.Background(), target)
+		r := shortOnce(context.Background(), target, true)
 
 		if r.class != classIntercepted {
 			t.Fatalf("class = %q (%v), want %q", r.class, r.err, classIntercepted)
@@ -68,7 +68,7 @@ func TestShortIntercepted(t *testing.T) {
 			_ = server.Close()
 		})
 
-		r := shortOnce(context.Background(), target)
+		r := shortOnce(context.Background(), target, true)
 		if r.class != classIntercepted || !strings.Contains(r.icpt.Err, "region-sing.pyck.cloud") {
 			t.Errorf("class %q interception %+v, want a hostname mismatch", r.class, r.icpt)
 		}
@@ -81,7 +81,7 @@ func TestShortIntercepted(t *testing.T) {
 	t.Run("bare IP is not verified", func(t *testing.T) {
 		target, _ := selfSigned(t, "")
 
-		if r := shortOnce(context.Background(), target); r.class != "" {
+		if r := shortOnce(context.Background(), target, true); r.class != "" {
 			t.Errorf("class = %q (%v), want success: a bare IP has no name to verify", r.class, r.err)
 		}
 	})

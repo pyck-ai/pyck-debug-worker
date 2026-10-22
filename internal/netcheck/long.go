@@ -55,13 +55,9 @@ func longLoop(ctx context.Context, t Target, agg *agg, store *store) {
 				return
 			}
 
-			if info, ok := interceptionOf(err); ok {
-				// No PINGs through a middlebox: they would measure it, not
-				// the path to the server.
-				noteInterception(agg, store, t, modeLong, info)
-			} else {
-				agg.fail(t, modeLong, classify(err))
-			}
+			// An intercepted connection is not used: PINGs would measure
+			// the middlebox, not the path to the server.
+			noteFailure(agg, store, t, modeLong, err)
 
 			if !sleep(ctx, backoff) {
 				return
@@ -99,12 +95,13 @@ func dialH2(ctx context.Context, t Target, dialer net.Dialer) (*longConn, error)
 		return nil, err
 	}
 
-	tlsConn := tls.Client(conn, tlsConfig(t, http2.NextProtoTLS))
+	counted := &countConn{Conn: conn}
+	tlsConn := tls.Client(counted, tlsConfig(t, http2.NextProtoTLS))
 
 	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 		_ = conn.Close()
 
-		return nil, wrapHandshake(err)
+		return nil, withPhase(wrapHandshake(err), handshakePhase(counted))
 	}
 
 	if tlsConn.ConnectionState().NegotiatedProtocol != http2.NextProtoTLS {
@@ -160,7 +157,7 @@ func session(ctx context.Context, t Target, conn *longConn, agg *agg) (event, bo
 			return event{}, false
 		case <-ticker.C:
 			if time.Since(lastAnswer) > deadAfter {
-				return ended(t, modeLong, started, conn, fmt.Errorf("%w for %s", errNoAnswer, deadAfter), agg), true
+				return ended(t, modeLong, phaseTransfer, started, conn, fmt.Errorf("%w for %s", errNoAnswer, deadAfter), agg), true
 			}
 
 			go ping(ctx, conn.cc, results)
@@ -179,7 +176,7 @@ func session(ctx context.Context, t Target, conn *longConn, agg *agg) (event, bo
 			case errors.Is(r.err, context.DeadlineExceeded):
 				agg.lostPing(t, modeLong)
 			default:
-				return ended(t, modeLong, started, conn, r.err, agg), true
+				return ended(t, modeLong, phaseTransfer, started, conn, r.err, agg), true
 			}
 		}
 	}
@@ -198,8 +195,8 @@ func ping(ctx context.Context, cc *http2.ClientConn, results chan<- pingResult) 
 
 // ended records the end of a long or idle connection. A connection the
 // server sent GOAWAY on (nginx keepalive_time, a reload) is server-closed, not
-// a drop.
-func ended(t Target, mode string, started time.Time, conn *longConn, err error, agg *agg) event {
+// a drop. A reset is counted in phase.
+func ended(t Target, mode, phase string, started time.Time, conn *longConn, err error, agg *agg) event {
 	name := eventDrop
 
 	// Closing without our own Close or Shutdown means a GOAWAY arrived.
@@ -217,6 +214,11 @@ func ended(t Target, mode string, started time.Time, conn *longConn, err error, 
 
 	if name == eventDrop {
 		ev.Class = dropClass(err)
+	}
+
+	if ev.Class == classReset {
+		ev.Phase = phase
+		agg.reset(t, mode, phase)
 	}
 
 	return ev

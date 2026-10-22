@@ -65,6 +65,28 @@ type idleDeath struct {
 	How string `json:"how"`
 }
 
+// SNI variants of the short connection.
+const (
+	sniHost = "host"
+	sniNone = "none"
+)
+
+// sniStats is one SNI variant's short connections in a minute.
+type sniStats struct {
+	Samples  int            `json:"samples"`
+	Failures map[string]int `json:"failures,omitempty"`
+}
+
+// ok is the variant's successful connections.
+func (s *sniStats) ok() int {
+	n := s.Samples
+	for _, c := range s.Failures {
+		n -= c
+	}
+
+	return n
+}
+
 // aggregate is one minute of one mode for one target.
 //
 // samples are connection attempts (short) or answered plus unanswered pings
@@ -90,6 +112,12 @@ type aggregate struct {
 	Cert *certInfo `json:"intercepted_cert,omitempty"`
 	// Idle is set for the idle mode.
 	Idle *idleStats `json:"idle,omitempty"`
+	// SNI splits a hostname target's short connections by SNI variant
+	// (host, none).
+	SNI map[string]*sniStats `json:"sni,omitempty"`
+	// Resets counts the minute's connection resets by phase (hello,
+	// transfer, idle).
+	Resets map[string]int `json:"resets,omitempty"`
 
 	target Target
 }
@@ -142,13 +170,23 @@ func (a aggregate) detail() string {
 	}
 
 	if len(a.Failures) > 0 {
-		classes := make([]string, 0, len(a.Failures))
-		for class, n := range a.Failures {
-			classes = append(classes, fmt.Sprintf("%s:%d", class, n))
+		parts = append(parts, "fail="+counts(a.Failures))
+	}
+
+	if len(a.Resets) > 0 {
+		parts = append(parts, "resets="+counts(a.Resets))
+	}
+
+	if len(a.SNI) > 0 {
+		sni := "sni ok"
+
+		for _, variant := range []string{sniHost, sniNone} {
+			if s, ok := a.SNI[variant]; ok {
+				sni += fmt.Sprintf(" %s %d/%d", variant, s.ok(), s.Samples)
+			}
 		}
 
-		sort.Strings(classes)
-		parts = append(parts, "fail="+strings.Join(classes, ","))
+		parts = append(parts, sni)
 	}
 
 	for _, s := range []struct {
@@ -182,6 +220,18 @@ func (a aggregate) detail() string {
 	return strings.Join(parts, "  ")
 }
 
+// counts renders a count map as sorted key:n pairs.
+func counts(m map[string]int) string {
+	out := make([]string, 0, len(m))
+	for k, n := range m {
+		out = append(out, fmt.Sprintf("%s:%d", k, n))
+	}
+
+	sort.Strings(out)
+
+	return strings.Join(out, ",")
+}
+
 // formatSeconds renders whole seconds without a fraction.
 func formatSeconds(s float64) string {
 	return strconv.FormatFloat(s, 'f', -1, 64)
@@ -200,6 +250,8 @@ type bucket struct {
 	tcp          *tcpStats
 	cert         *certInfo
 	died         *idleDeath
+	sni          map[string]*sniStats
+	resets       map[string]int
 }
 
 // bucketKey identifies a bucket.
@@ -308,6 +360,43 @@ func (a *agg) intercepted(t Target, mode string, info interception) bool {
 	a.lastFP[t] = info.Fingerprint
 
 	return true
+}
+
+// sni records one short connection's outcome for its SNI variant; class is
+// empty on success.
+func (a *agg) sni(t Target, variant, class string) {
+	a.with(t, modeShort, func(b *bucket) {
+		if b.sni == nil {
+			b.sni = map[string]*sniStats{}
+		}
+
+		s, ok := b.sni[variant]
+		if !ok {
+			s = &sniStats{}
+			b.sni[variant] = s
+		}
+
+		s.Samples++
+
+		if class != "" {
+			if s.Failures == nil {
+				s.Failures = map[string]int{}
+			}
+
+			s.Failures[class]++
+		}
+	})
+}
+
+// reset counts a connection reset in phase.
+func (a *agg) reset(t Target, mode, phase string) {
+	a.with(t, mode, func(b *bucket) {
+		if b.resets == nil {
+			b.resets = map[string]int{}
+		}
+
+		b.resets[phase]++
+	})
 }
 
 // short records one completed short connection.
@@ -438,6 +527,8 @@ func (b *bucket) aggregate(minute time.Time, t Target, mode string) aggregate {
 		ServerClosed: b.serverClosed,
 		TCP:          b.tcp,
 		Cert:         b.cert,
+		SNI:          b.sni,
+		Resets:       b.resets,
 		target:       t,
 	}
 }

@@ -71,7 +71,7 @@ func TestShortOnce(t *testing.T) {
 			_, _ = io.Copy(io.Discard, server)
 		})
 
-		r := shortOnce(context.Background(), target)
+		r := shortOnce(context.Background(), target, true)
 		if r.class != "" || r.connect <= 0 || r.handshake <= 0 {
 			t.Errorf("shortOnce = %+v, want a completed handshake", r)
 		}
@@ -81,7 +81,7 @@ func TestShortOnce(t *testing.T) {
 		ln, target := listen(t, roots)
 		_ = ln.Close()
 
-		if r := shortOnce(context.Background(), target); r.class != classRefused {
+		if r := shortOnce(context.Background(), target, true); r.class != classRefused {
 			t.Errorf("class = %q (%v), want %q", r.class, r.err, classRefused)
 		}
 	})
@@ -90,7 +90,7 @@ func TestShortOnce(t *testing.T) {
 		ln, target := listen(t, roots)
 		serve(ln, reset)
 
-		if r := shortOnce(context.Background(), target); r.class != classReset {
+		if r := shortOnce(context.Background(), target, true); r.class != classReset {
 			t.Errorf("class = %q (%v), want %q", r.class, r.err, classReset)
 		}
 	})
