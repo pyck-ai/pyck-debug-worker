@@ -49,6 +49,7 @@ func resolveLoop(ctx context.Context, host string, sh *shared) {
 			wg.Go(func() { longLoop(tctx, t, agg, store) })
 			wg.Go(func() { idleLoop(tctx, t, agg, store) })
 			wg.Go(func() { tputLoop(tctx, t, sh) })
+			wg.Go(func() { traceLoop(tctx, t, sh) })
 		}
 
 		for ip, cancel := range running {

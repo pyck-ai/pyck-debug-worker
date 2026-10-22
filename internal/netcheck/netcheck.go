@@ -306,6 +306,8 @@ type shared struct {
 	dns   dnsChecker
 	// tput holds the one download running at a time.
 	tput chan struct{}
+	// jumps wakes route traces on latency jumps.
+	jumps *jumps
 }
 
 // Run measures until ctx is cancelled, then flushes and closes the day file.
@@ -331,7 +333,8 @@ func Run(ctx context.Context, cfg Config, out io.Writer) {
 
 	sh := &shared{
 		roots: cfg.Roots, agg: agg, store: store, p: p, dns: newDNSChecker(cfg.Roots),
-		tput: make(chan struct{}, 1),
+		tput:  make(chan struct{}, 1),
+		jumps: newJumps(),
 	}
 
 	var wg sync.WaitGroup
@@ -349,12 +352,12 @@ func Run(ctx context.Context, cfg Config, out io.Writer) {
 		wg.Go(func() { uploadLoop(ctx, store, hostname, p) })
 	}
 
-	minuteLoop(ctx, agg, store, p)
+	minuteLoop(ctx, sh)
 	wg.Wait()
 }
 
 // minuteLoop flushes the aggregates at every UTC minute boundary.
-func minuteLoop(ctx context.Context, agg *agg, store *store, p *printer) {
+func minuteLoop(ctx context.Context, sh *shared) {
 	for {
 		next := time.Now().UTC().Truncate(time.Minute).Add(time.Minute)
 
@@ -368,15 +371,21 @@ func minuteLoop(ctx context.Context, agg *agg, store *store, p *printer) {
 		case <-timer.C:
 		}
 
-		flushMinute(agg, store, p, next.Add(-time.Minute))
+		flushMinute(sh, next.Add(-time.Minute))
 	}
 }
 
-// flushMinute writes and prints one minute's aggregates.
-func flushMinute(agg *agg, store *store, p *printer, minute time.Time) {
+// flushMinute writes and prints one minute's aggregates and checks them for
+// latency jumps.
+func flushMinute(sh *shared, minute time.Time) {
+	store, p := sh.store, sh.p
+	recs := sh.agg.flush(minute)
+
+	sh.jumps.observe(recs)
+
 	var failed error
 
-	for _, rec := range agg.flush(minute) {
+	for _, rec := range recs {
 		if err := store.write(rec.TS, rec); err != nil && failed == nil {
 			failed = err
 		}

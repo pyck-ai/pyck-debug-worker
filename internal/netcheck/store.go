@@ -64,6 +64,10 @@ type event struct {
 	// are every resolver's A records of a dns-mismatch event.
 	Resolver string              `json:"resolver,omitempty"`
 	Answers  map[string][]string `json:"answers,omitempty"`
+	// Path and PrevPath are a route-changed event's hop IPs, "*" for a
+	// silent TTL.
+	Path     []string `json:"path,omitempty"`
+	PrevPath []string `json:"prev_path,omitempty"`
 }
 
 // Event names.
@@ -76,6 +80,7 @@ const (
 	eventIntercepted  = "intercepted"
 	eventDNSMismatch  = "dns-mismatch"
 	eventUnreachable  = "resolver-unreachable"
+	eventRouteChanged = "route-changed"
 )
 
 // newEvent stamps an event now.
