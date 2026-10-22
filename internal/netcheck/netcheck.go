@@ -336,6 +336,11 @@ func Run(ctx context.Context, cfg Config, out io.Writer) {
 		wg.Go(func() { resolveLoop(ctx, host, sh) })
 	}
 
+	for _, t := range compareTargets {
+		agg.registerModes(t, []string{modeCompare})
+		wg.Go(func() { compareLoop(ctx, t, agg) })
+	}
+
 	if cfg.Upload {
 		wg.Go(func() { uploadLoop(ctx, store, hostname, p) })
 	}

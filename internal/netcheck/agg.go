@@ -16,10 +16,12 @@ const (
 	modeShort = "short"
 	modeLong  = "long"
 	modeIdle  = "idle"
+	// modeCompare is a comparison target's TCP connect.
+	modeCompare = "compare"
 )
 
-// modes is the per-target emission order.
-var modes = []string{modeShort, modeLong, modeIdle}
+// targetModes are a measured host's modes, in emission order.
+var targetModes = []string{modeShort, modeLong, modeIdle}
 
 // stats summarises one minute of latency samples, in milliseconds.
 type stats struct {
@@ -146,7 +148,7 @@ func (a aggregate) label() string {
 // duration is the stdout duration column: the median latency of the minute.
 func (a aggregate) duration() time.Duration {
 	s := a.RTT
-	if a.Mode == modeShort {
+	if a.Mode == modeShort || a.Mode == modeCompare {
 		s = a.Connect
 	}
 
@@ -264,6 +266,7 @@ type bucketKey struct {
 type agg struct {
 	mu      sync.Mutex
 	targets []Target
+	modes   map[Target][]string
 	removed map[Target]bool
 	buckets map[bucketKey]*bucket
 	// lastFP is the last intercepted fingerprint per target, across minutes
@@ -276,6 +279,7 @@ type agg struct {
 
 func newAgg() *agg {
 	return &agg{
+		modes:    map[Target][]string{},
 		removed:  map[Target]bool{},
 		buckets:  map[bucketKey]*bucket{},
 		lastFP:   map[Target]string{},
@@ -283,8 +287,13 @@ func newAgg() *agg {
 	}
 }
 
-// register starts collecting for t.
+// register starts collecting a measured host's modes for t.
 func (a *agg) register(t Target) {
+	a.registerModes(t, targetModes)
+}
+
+// registerModes starts collecting modes for t.
+func (a *agg) registerModes(t Target, modes []string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -293,6 +302,8 @@ func (a *agg) register(t Target) {
 	if !slices.Contains(a.targets, t) {
 		a.targets = append(a.targets, t)
 	}
+
+	a.modes[t] = modes
 
 	for _, mode := range modes {
 		if _, ok := a.buckets[bucketKey{t, mode}]; !ok {
@@ -329,7 +340,7 @@ func (a *agg) fail(t Target, mode, class string) {
 
 		b.failures[class]++
 
-		if mode == modeShort {
+		if mode == modeShort || mode == modeCompare {
 			b.samples++
 		}
 	})
@@ -409,6 +420,15 @@ func (a *agg) short(t Target, connect, handshake time.Duration, synRetrans int) 
 	})
 }
 
+// connect records one TCP connect to a comparison target.
+func (a *agg) connect(t Target, connect time.Duration, synRetrans int) {
+	a.with(t, modeCompare, func(b *bucket) {
+		b.samples++
+		b.losses += synRetrans
+		b.connect = append(b.connect, ms(connect))
+	})
+}
+
 // ping records one answered PING on the long or idle connection.
 func (a *agg) ping(t Target, mode string, rtt time.Duration) {
 	a.with(t, mode, func(b *bucket) {
@@ -472,10 +492,12 @@ func (a *agg) flush(minute time.Time) []aggregate {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	out := make([]aggregate, 0, len(a.targets)*len(modes))
+	out := make([]aggregate, 0, len(a.targets)*len(targetModes))
 	kept := a.targets[:0]
 
 	for _, t := range a.targets {
+		modes := a.modes[t]
+
 		for _, mode := range modes {
 			key := bucketKey{t, mode}
 			rec := a.buckets[key].aggregate(minute, t, mode)
@@ -495,6 +517,7 @@ func (a *agg) flush(minute time.Time) []aggregate {
 				delete(a.buckets, bucketKey{t, mode})
 			}
 
+			delete(a.modes, t)
 			delete(a.lastFP, t)
 			delete(a.survived, t)
 
