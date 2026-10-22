@@ -207,6 +207,121 @@ of it probe results), ~1.7 MB/day gzipped as uploaded.
   (`answers` per resolver), `resolver-unreachable` (`resolver`, `class`,
   `error`), `route-changed` (`path`, `prev_path`, `*` for a silent TTL).
 
+### Field reference
+
+Every line of `netcheck/YYYY-MM-DD.json` is one JSON object with a `type`.
+Conventions:
+
+* `ts` is UTC RFC 3339; an `agg` `ts` is the start of its minute, other records
+  carry fractional seconds.
+* Units are in the name: `_ms` milliseconds, `_s` seconds, `mbit_s` megabit/s.
+  Latencies are rounded to microseconds.
+* Percentiles are nearest-rank over the minute's samples. `jitter_ms` is the
+  mean absolute difference between consecutive samples in arrival order (0 for
+  one sample).
+* **A missing field means none**: empty strings, zeros, `false` and empty lists
+  are omitted where the tables say so. Always-present fields are listed as such.
+* IPs are IPv4 strings. Failure classes: `timeout`, `refused`, `reset`, `other`,
+  `intercepted`; a download adds `status`, `size`. Reset phases: `hello`,
+  `transfer`, `idle`.
+
+**`header`** — first line of each file (a restart appends, no second header).
+
+| field | type | |
+|---|---|---|
+| `version`, `hostname`, `os` | string | always; `os` is `GOOS/GOARCH` |
+| `flags.hosts` | string[] | always |
+| `flags.upload` | bool | always |
+
+**`agg`** — one per minute, target and `mode`. Always present: `host`, `ip`,
+`mode`, `samples`, `losses`, `drops`. Comparison targets have `host` `alidns` or
+`cloudflare`.
+
+| field | type | present |
+|---|---|---|
+| `samples` | int | all modes: connects (short, compare), answered + unanswered PINGs (long, idle). Failed short/compare connects count too |
+| `losses` | int | SYN retransmits inferred from a 1s/3s connect (short, compare); unanswered PINGs (long, idle) |
+| `drops` | int | connections that died (long, idle); always 0 for short, compare |
+| `connect`, `tls`, `rtt` | stats object | when the minute has such samples: `connect` (short, compare), `tls` (short), `rtt` (long, idle). Object: `min_ms`, `p50_ms`, `p95_ms`, `p99_ms`, `max_ms`, `jitter_ms` |
+| `failures` | {class: int} | when any failure; includes `intercepted` |
+| `server_closed` | int | when > 0 (long, idle): server GOAWAY, not a drop |
+| `tcp` | {`rtt_ms`, `rttvar_ms`, `retrans`} | long only, Linux only (`TCP_INFO`, last reading; `retrans` counted in the minute) |
+| `intercepted_cert` | {`fingerprint`, `issuer`, `error`} | only when the minute had an interception (last one); `fingerprint` is hex SHA-256 of the leaf |
+| `resets` | {phase: int} | when any reset (short, long, idle) |
+| `sni` | {`host`/`none`: {`samples`, `failures`}} | short, hostname targets only (not bare IPs); `samples` includes failures, `failures` omitted when none |
+| `idle` | {`survived_s`, `died`} | idle only, always. `survived_s`: longest gap the current connection survived (0 on a fresh one). `died`, when a connection ended this minute: `gap_s` (gap after which the PING failed, 0 = first PING), `survived_s`, `how` (`timeout`, `reset`, `other`, `server-closed`) |
+
+**`event`** — always `ts`, `event`, `host`; `ip` unless the event is about the
+host as a whole.
+
+| `event` | extra fields (all omitted when empty/0) |
+|---|---|
+| `ip-added`, `ip-removed` | — |
+| `drop` | `mode` (`long`/`idle`), `lifetime_s`, `error`, `class` (`timeout`/`reset`/`other`), `phase` (only for a reset); idle also `gap_s`, `survived_s` |
+| `server-closed` | `mode`, `lifetime_s`, `error`; idle also `gap_s`, `survived_s` |
+| `resolve-failed` | `error` (no `ip`) |
+| `intercepted` | `mode` (`short`/`long`/`idle`/`throughput`), `fingerprint`, `issuer`, `error`; first time per target and on each fingerprint change |
+| `dns-mismatch` | `answers`: {resolver: ip[]} for resolvers that answered (no `ip`) |
+| `resolver-unreachable` | `resolver`, `class`, `error` (no `ip`) |
+| `route-changed` | `path`, `prev_path`: hop IPs by TTL, `*` for a silent TTL |
+
+**`dns`** — per host and 5-minute check. Always: `host`, `answers`, `mismatch`.
+
+| field | type | |
+|---|---|---|
+| `answers[]` | object | `system`, `alidns`, `cloudflare`, in that order |
+| `answers[].resolver`, `.ms`, `.ips` | string, ms, string[] | always; `ips` sorted, `[]` if none |
+| `answers[].nxdomain` | bool | only if the name does not exist |
+| `answers[].error`, `.class` | string | only if the resolver could not be asked |
+| `mismatch` | bool | resolvers that answered disagree on the A set |
+| `unreachable` | string[] | resolvers that could not be asked; omitted when none |
+
+**`throughput`** — per download. Always: `host`, `ip`, `ok`, `bytes`.
+
+| field | type | omitted when |
+|---|---|---|
+| `ok` | bool | — (true = 200 and exactly 1,048,576 bytes) |
+| `status`, `proto` | int, string (`HTTP/2.0`) | no response |
+| `bytes` | int | — (body bytes read, capped at 1 MiB + 1) |
+| `connect_ms`, `tls_ms` | ms | not measured |
+| `ttfb_ms` | ms | request written → first response byte |
+| `body_ms`, `mbit_s`, `stall_ms` | ms, Mbit/s, ms | first byte → end of body; speed over `body_ms`; longest wait between reads |
+| `server` | string | no `Server` header |
+| `block_hint` | string | `ok`, or the body does not look like HTML; else its title (`Web Filter: …` when it mentions one) |
+| `class`, `phase`, `error` | string | `ok`; `phase` only for a reset |
+| `intercepted_cert` | as in `agg` | certificate verified fine |
+
+**`trace`** — Linux only, per trace. Always: `host`, `ip`, `reason`, `hops`,
+`reached`, `duration_ms`.
+
+| field | type | |
+|---|---|---|
+| `reason` | string | `startup`, `hourly`, `latency-jump` |
+| `hops[]` | object | `ttl` (always); `ip`, `rtt_ms` omitted for a silent TTL; `carrier` (`CN2`, `ChinaNet`, `Unicom-AS4837`, `ChinaMobile`) only for a tagged IP |
+| `reached` | bool | the destination itself answered |
+| `pmtu` | int | omitted when unknown |
+| `route_changed` | bool | only when true: a hop IP differs from the previous trace (silent TTLs match anything) |
+| `error` | string | only when the trace failed |
+
+**`probe`** — one per `--env` probe stage result, as printed.
+
+| field | type | |
+|---|---|---|
+| `ts`, `target`, `stage`, `ok`, `duration_ms` | | always |
+| `detail` | string | omitted when empty |
+
+`jq` examples:
+
+```sh
+F=netcheck/2026-10-22.json
+# p95 PING RTT per minute and host/IP
+jq -r 'select(.type=="agg" and .mode=="long" and .rtt) | [.ts,.host,.ip,.rtt.p95_ms] | @tsv' $F
+# minutes with any loss, drop or failure
+jq -c 'select(.type=="agg" and (.losses>0 or .drops>0 or .failures!=null)) | {ts,host,ip,mode,losses,drops,failures}' $F
+# throughput history
+jq -r 'select(.type=="throughput") | [.ts,.host,.ok,.mbit_s,.ttfb_ms,.stall_ms,.class//""] | @tsv' $F
+```
+
 ### Upload (`--netcheck-upload`)
 
 After each UTC midnight, and at startup for any earlier day not yet sent, each
@@ -240,6 +355,42 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now pyck-debug-worker@test.service
 journalctl -u pyck-debug-worker@test -f
 ```
+
+### Enabling netcheck on the service
+
+`sudo systemctl edit pyck-debug-worker@test` (writes
+`/etc/systemd/system/pyck-debug-worker@test.service.d/override.conf`); the empty
+`ExecStart=` clears the base unit's command first. `%i` is the instance name:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/pyck-debug-worker --env %i --netcheck --netcheck-hosts=region-sing.pyck.cloud,region-japan.pyck.cloud
+```
+
+With the daily upload to `debug.pyck.cloud` (see [Upload](#upload---netcheck-upload)):
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/pyck-debug-worker --env %i --netcheck --netcheck-upload --netcheck-hosts=region-sing.pyck.cloud,region-japan.pyck.cloud
+```
+
+```sh
+sudo systemctl daemon-reload && sudo systemctl restart pyck-debug-worker@test
+```
+
+The day files are in `/var/lib/pyck-debug-worker/netcheck/YYYY-MM-DD.json`
+(sent days are renamed `….json.sent`). The unit runs as a dynamic user and the
+directory is not world-readable, so read as root:
+
+```sh
+sudo ls -l /var/lib/pyck-debug-worker/netcheck/
+sudo jq -c 'select(.type=="event")' /var/lib/pyck-debug-worker/netcheck/$(date -u +%F).json
+journalctl -u pyck-debug-worker@test -f | grep ' nc-'   # the per-minute lines
+```
+
+All instances share that directory: enable netcheck on one instance per host.
 
 ### Printing the first cycle (`--print`)
 
