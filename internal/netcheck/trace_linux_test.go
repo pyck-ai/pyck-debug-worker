@@ -138,6 +138,20 @@ func TestTracerLower(t *testing.T) {
 	}
 }
 
+func TestFlowPort(t *testing.T) {
+	a, b := netip.MustParseAddr("192.0.2.10"), netip.MustParseAddr("192.0.2.11")
+
+	if first, again := flowPort(a), flowPort(netip.MustParseAddr("192.0.2.10")); first != again {
+		t.Errorf("flowPort is not stable: %d, then %d", first, again)
+	}
+
+	for _, ip := range []netip.Addr{a, b} {
+		if p := flowPort(ip); p < srcPortBase || p >= srcPortBase+srcPorts {
+			t.Errorf("flowPort(%s) = %d, out of range", ip, p)
+		}
+	}
+}
+
 // TestTraceLoopback runs a real, unprivileged trace: on loopback the
 // destination answers the first probe with port unreachable.
 func TestTraceLoopback(t *testing.T) {

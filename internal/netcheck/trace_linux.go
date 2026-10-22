@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net/netip"
 	"syscall"
 	"time"
@@ -29,9 +30,12 @@ const (
 	// maxSilent ends the trace after this many TTLs in a row without any
 	// answer: the destination usually drops UDP.
 	maxSilent = 5
-	// basePort is the first destination port; every probe uses the next
-	// one, so an answer identifies its probe by the port it quotes.
-	basePort = 33434
+	// dstPort is every probe's destination port.
+	dstPort = 33434
+	// srcPortBase and srcPorts span the source ports a target's flow is
+	// pinned to.
+	srcPortBase = 40000
+	srcPorts    = 20000
 	// udpIPHeaders is the IPv4 plus UDP header size.
 	udpIPHeaders = 28
 	// minMTU is the IPv4 minimum, the floor when an MTU error carries none.
@@ -126,14 +130,15 @@ func parseRecvErr(oob []byte) (recvErr, bool) {
 // routers' ICMP errors from the socket's error queue, like tracepath: no raw
 // socket, no privilege. Probes carry DF and start at the route's MTU; a
 // fragmentation-needed answer lowers it, which is how the path MTU is found.
+//
+// Every probe to dst, in every trace, is the same UDP flow (fixed source and
+// destination port, as Paris traceroute does), so load-balancing routers
+// hash it onto the same path and a changed hop is a changed route, not a
+// different equal-cost branch. Probes are told apart by a sequence number in
+// their payload.
 func traceRoute(ctx context.Context, dst netip.Addr) (traceResult, error) {
 	if !dst.Is4() {
 		return traceResult{}, errNoIPv4
-	}
-
-	mtu, err := routeMTU(dst)
-	if err != nil {
-		return traceResult{}, err
 	}
 
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
@@ -142,6 +147,24 @@ func traceRoute(ctx context.Context, dst netip.Addr) (traceResult, error) {
 	}
 
 	defer unix.Close(fd)
+
+	// Our own concurrent traces may share a source port; their connected
+	// sockets still differ by destination.
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+		return traceResult{}, fmt.Errorf("trace SO_REUSEADDR: %w", err)
+	}
+
+	// Taken by someone else: an ephemeral port still traces, only without
+	// the same flow as the previous trace.
+	if err := unix.Bind(fd, &unix.SockaddrInet4{Port: flowPort(dst)}); err != nil {
+		if err := unix.Bind(fd, &unix.SockaddrInet4{}); err != nil {
+			return traceResult{}, fmt.Errorf("trace bind: %w", err)
+		}
+	}
+
+	if err := unix.Connect(fd, &unix.SockaddrInet4{Port: dstPort, Addr: dst.As4()}); err != nil {
+		return traceResult{}, fmt.Errorf("trace route: %w", err)
+	}
 
 	if err := unix.SetsockoptInt(fd, unix.SOL_IP, unix.IP_RECVERR, 1); err != nil {
 		return traceResult{}, fmt.Errorf("trace IP_RECVERR: %w", err)
@@ -155,38 +178,30 @@ func traceRoute(ctx context.Context, dst netip.Addr) (traceResult, error) {
 		}
 	}
 
-	tr := tracer{fd: fd, dst: dst.As4(), mtu: mtu}
+	mtu, err := unix.GetsockoptInt(fd, unix.SOL_IP, unix.IP_MTU)
+	if err != nil {
+		return traceResult{}, fmt.Errorf("trace IP_MTU: %w", err)
+	}
+
+	tr := tracer{fd: fd, mtu: mtu}
 
 	return tr.run(ctx)
 }
 
-// routeMTU is the MTU of the route to dst, read from a connected UDP socket.
-func routeMTU(dst netip.Addr) (int, error) {
-	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
-	if err != nil {
-		return 0, fmt.Errorf("trace socket: %w", err)
-	}
+// flowPort is dst's source port: fixed per destination, so every trace to it
+// is the same flow.
+func flowPort(dst netip.Addr) int {
+	h := fnv.New32a()
+	_, _ = h.Write(dst.AsSlice())
 
-	defer unix.Close(fd)
-
-	if err := unix.Connect(fd, &unix.SockaddrInet4{Port: basePort, Addr: dst.As4()}); err != nil {
-		return 0, fmt.Errorf("trace route: %w", err)
-	}
-
-	mtu, err := unix.GetsockoptInt(fd, unix.SOL_IP, unix.IP_MTU)
-	if err != nil {
-		return 0, fmt.Errorf("trace IP_MTU: %w", err)
-	}
-
-	return mtu, nil
+	return srcPortBase + int(h.Sum32()%srcPorts)
 }
 
 // tracer is one trace in progress.
 type tracer struct {
-	fd    int
-	dst   [4]byte
-	mtu   int
-	probe int
+	fd  int
+	mtu int
+	seq uint32
 }
 
 // run probes TTL 1 upwards until the destination answers, a router declares
@@ -231,17 +246,13 @@ func (tr *tracer) hop(ctx context.Context, ttl int) (traceHop, replyKind, error)
 	hop := traceHop{TTL: ttl}
 
 	for try := 0; try < probesPerHop; {
-		port := basePort + tr.probe
-		tr.probe++
+		tr.seq++
 
-		payload := make([]byte, tr.mtu-udpIPHeaders)
-		sent := time.Now()
-
-		err := unix.Sendto(tr.fd, payload, 0, &unix.SockaddrInet4{Port: port, Addr: tr.dst})
+		sent, err := tr.send()
 		if errors.Is(err, unix.EMSGSIZE) {
 			// Larger than the local route allows: the error queue says by
 			// how much.
-			if !tr.lower(tr.drainMTU()) {
+			if !tr.lower(tr.drain()) {
 				try++
 			}
 
@@ -252,7 +263,7 @@ func (tr *tracer) hop(ctx context.Context, ttl int) (traceHop, replyKind, error)
 			return hop, replyIgnore, fmt.Errorf("trace send: %w", err)
 		}
 
-		e, rtt, ok, err := tr.wait(ctx, port, sent)
+		e, rtt, ok, err := tr.wait(ctx, sent)
 		if err != nil {
 			return hop, replyIgnore, err
 		}
@@ -281,6 +292,28 @@ func (tr *tracer) hop(ctx context.Context, ttl int) (traceHop, replyKind, error)
 	return hop, replyIgnore, nil
 }
 
+// send drains stale errors and sends probe tr.seq. On a connected socket a
+// queued ICMP error also fails the next send once; draining clears it.
+func (tr *tracer) send() (time.Time, error) {
+	payload := make([]byte, tr.mtu-udpIPHeaders)
+	binary.BigEndian.PutUint32(payload, tr.seq)
+
+	var err error
+
+	for range 2 {
+		tr.drain()
+
+		sent := time.Now()
+
+		_, err = unix.Write(tr.fd, payload)
+		if err == nil || errors.Is(err, unix.EMSGSIZE) {
+			return sent, err
+		}
+	}
+
+	return time.Time{}, err
+}
+
 // lower drops the probe MTU to mtu or, when mtu says nothing useful, by a
 // header's worth, never below minMTU. It reports whether the MTU dropped.
 func (tr *tracer) lower(mtu uint32) bool {
@@ -295,8 +328,9 @@ func (tr *tracer) lower(mtu uint32) bool {
 	return tr.mtu < old
 }
 
-// drainMTU reads the error queue for the MTU of a local EMSGSIZE.
-func (tr *tracer) drainMTU() uint32 {
+// drain empties the error queue and returns the MTU of a local EMSGSIZE in
+// it, if any.
+func (tr *tracer) drain() uint32 {
 	var mtu uint32
 
 	for {
@@ -311,10 +345,11 @@ func (tr *tracer) drainMTU() uint32 {
 	}
 }
 
-// wait waits for the error queue entry answering the probe sent to port.
-// Answers to earlier probes are skipped. It reports false when the probe
-// stayed unanswered.
-func (tr *tracer) wait(ctx context.Context, port int, sent time.Time) (recvErr, time.Duration, bool, error) {
+// wait waits for the error queue entry answering probe tr.seq. An answer
+// quoting another sequence number is late and skipped; a router quoting no
+// payload is taken as answering the one probe in flight. It reports false
+// when the probe stayed unanswered.
+func (tr *tracer) wait(ctx context.Context, sent time.Time) (recvErr, time.Duration, bool, error) {
 	deadline := sent.Add(probeTimeout)
 
 	for {
@@ -342,37 +377,37 @@ func (tr *tracer) wait(ctx context.Context, port int, sent time.Time) (recvErr, 
 		}
 
 		for {
-			e, to, ok := tr.recv()
+			e, quoted, ok := tr.recv()
 			if !ok {
 				break
 			}
 
-			if to == port {
+			if e.kind() == replyIgnore {
+				continue
+			}
+
+			if len(quoted) < 4 || binary.BigEndian.Uint32(quoted) == tr.seq {
 				return e, time.Since(sent), true, nil
 			}
 		}
 	}
 }
 
-// recv takes one entry off the error queue, with the destination port of the
-// probe it answers.
-func (tr *tracer) recv() (recvErr, int, bool) {
+// recv takes one entry off the error queue, with the start of the probe
+// payload the ICMP error quotes.
+func (tr *tracer) recv() (recvErr, []byte, bool) {
+	buf := make([]byte, 64)
 	oob := make([]byte, 512)
 
-	_, oobn, _, from, err := unix.Recvmsg(tr.fd, make([]byte, 64), oob, unix.MSG_ERRQUEUE|unix.MSG_DONTWAIT)
+	n, oobn, _, _, err := unix.Recvmsg(tr.fd, buf, oob, unix.MSG_ERRQUEUE|unix.MSG_DONTWAIT)
 	if err != nil {
-		return recvErr{}, 0, false
+		return recvErr{}, nil, false
 	}
 
 	e, ok := parseRecvErr(oob[:oobn])
 	if !ok {
-		return recvErr{}, 0, true
+		return recvErr{}, nil, true
 	}
 
-	sa, _ := from.(*unix.SockaddrInet4)
-	if sa == nil {
-		return e, 0, true
-	}
-
-	return e, sa.Port, true
+	return e, buf[:n], true
 }
