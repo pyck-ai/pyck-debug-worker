@@ -27,8 +27,15 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -o /out/pyck-debug-worker \
       ./cmd/pyck-debug-worker
 
+# Working directory for --netcheck (writes netcheck/ here), owned by the
+# runtime user so a named volume mounted on it is writable.
+RUN mkdir -p /out/data
+
 FROM ghcr.io/pyck-ai/baseimages/static:latest
 
 COPY --from=build /out/pyck-debug-worker /pyck-debug-worker
+COPY --from=build --chown=1001:1001 /out/data /data
+
+WORKDIR /data
 
 ENTRYPOINT ["/pyck-debug-worker"]

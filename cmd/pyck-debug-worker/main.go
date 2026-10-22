@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pyck-ai/pyck-debug-worker/internal/buildinfo"
+	"github.com/pyck-ai/pyck-debug-worker/internal/netcheck"
 	"github.com/pyck-ai/pyck-debug-worker/internal/printcheck"
 	"github.com/pyck-ai/pyck-debug-worker/internal/probe"
 	"github.com/pyck-ai/pyck-debug-worker/internal/report"
@@ -56,6 +57,8 @@ const (
 	hardcodedDeep = true
 	// maxConcurrentTargets bounds how many targets are probed at once.
 	maxConcurrentTargets = 8
+	// probeQueue is how many cycles may wait to be written by netcheck.
+	probeQueue = 4
 )
 
 // Environment variables read for credentials and identity. Secrets never come
@@ -143,7 +146,48 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	banner(stdout, targets, creds, cfg.print, printCfg)
 
-	return loop(targets, creds, printCfg, cfg.print, stdout)
+	var nc *netcheck.Config
+
+	if cfg.netcheck {
+		nc = &netcheck.Config{
+			Hosts:   cfg.netcheckHosts,
+			Upload:  cfg.netcheckUpload,
+			Dir:     netcheck.Dir,
+			Version: buildinfo.String(),
+			Probes:  make(chan []report.Result, probeQueue),
+		}
+
+		netcheckBanner(stdout, *nc)
+
+		// The probe cycle and netcheck share stdout from two goroutines.
+		stdout = &syncWriter{w: stdout}
+	}
+
+	return loop(targets, creds, printCfg, cfg.print, nc, stdout)
+}
+
+// syncWriter serialises writes so concurrent lines never interleave.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+// Write implements io.Writer.
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.w.Write(p)
+}
+
+// netcheckBanner states what netcheck measures and where it writes.
+func netcheckBanner(w io.Writer, nc netcheck.Config) {
+	upload := "off"
+	if nc.Upload {
+		upload = "finished days to debug.pyck.cloud"
+	}
+
+	fmt.Fprintf(w, "netcheck %s  dir %s/  upload %s\n", strings.Join(nc.Hosts, ","), nc.Dir, upload)
 }
 
 // stringList collects a repeatable flag.
@@ -168,6 +212,10 @@ type config struct {
 	print     bool
 	tokenFile string
 	fs        *flag.FlagSet
+
+	netcheck       bool
+	netcheckUpload bool
+	netcheckHosts  []string
 }
 
 // secretFlags are flag names that would put a credential in argv.
@@ -212,6 +260,14 @@ func parseFlags(args []string, stderr io.Writer) (*config, error) {
 		"after the first cycle, post that cycle's lines to fax.pyck.cloud and print a QR label "+
 			"linking to them on the Windows print server's ZPL label printer (a real label comes out)")
 
+	fs.BoolVar(&cfg.netcheck, "netcheck", false,
+		"measure long-term connection quality to --netcheck-hosts and write per-minute results to ./"+netcheck.Dir+"/")
+	fs.BoolVar(&cfg.netcheckUpload, "netcheck-upload", false,
+		"with --netcheck, upload each finished day to debug.pyck.cloud")
+
+	hosts := fs.String("netcheck-hosts", netcheck.DefaultHosts,
+		"with --netcheck, comma-separated hosts to measure")
+
 	cfg.fs = fs
 
 	if err := fs.Parse(args); err != nil {
@@ -222,7 +278,40 @@ func parseFlags(args []string, stderr io.Writer) (*config, error) {
 		return nil, fmt.Errorf("%w: unexpected argument %q", errUsage, fs.Arg(0))
 	}
 
+	if err := cfg.checkNetcheck(*hosts); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// checkNetcheck refuses the netcheck sub-flags without --netcheck and
+// validates the host list.
+func (c *config) checkNetcheck(hosts string) error {
+	var given []string
+
+	c.fs.Visit(func(f *flag.Flag) {
+		if f.Name == "netcheck-upload" || f.Name == "netcheck-hosts" {
+			given = append(given, f.Name)
+		}
+	})
+
+	if !c.netcheck {
+		if len(given) > 0 {
+			return fmt.Errorf("%w: --%s requires --netcheck", errUsage, given[0])
+		}
+
+		return nil
+	}
+
+	parsed, err := netcheck.ParseHosts(hosts)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errUsage, err)
+	}
+
+	c.netcheckHosts = parsed
+
+	return nil
 }
 
 // resolveTargets expands --env into the probe set, rejecting anything on the
@@ -367,9 +456,25 @@ func banner(w io.Writer, targets []target.Target, creds credentials, printing bo
 }
 
 // loop runs cycles until SIGINT/SIGTERM, then prints the run summary.
-func loop(targets []target.Target, creds credentials, printCfg printcheck.Config, printing bool, out io.Writer) int {
+func loop(
+	targets []target.Target, creds credentials, printCfg printcheck.Config, printing bool,
+	nc *netcheck.Config, out io.Writer,
+) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Netcheck runs beside the probe cycle and never affects the exit code.
+	netcheckDone := make(chan struct{})
+
+	if nc != nil {
+		go func() {
+			defer close(netcheckDone)
+
+			netcheck.Run(ctx, *nc, out)
+		}()
+	} else {
+		close(netcheckDone)
+	}
 
 	labels := make([]string, 0, len(targets))
 	for _, t := range targets {
@@ -402,6 +507,7 @@ func loop(targets []target.Target, creds credentials, printCfg printcheck.Config
 		})
 
 		fmt.Fprintln(out, run.Add(probed))
+		persistProbes(nc, probed.Results)
 
 		// Once, after the first cycle and before the first tick. Never inside
 		// the loop: every run of this puts a page in a physical output tray.
@@ -420,6 +526,9 @@ func loop(targets []target.Target, creds credentials, printCfg printcheck.Config
 		break
 	}
 
+	// Let netcheck flush and close its day file before the process exits.
+	<-netcheckDone
+
 	fmt.Fprintln(out, run.Summary(time.Now()))
 
 	// A print that was explicitly asked for and did not happen is a failure of
@@ -429,6 +538,20 @@ func loop(targets []target.Target, creds credentials, printCfg printcheck.Config
 	}
 
 	return exitOK
+}
+
+// persistProbes hands a cycle's results to netcheck, which writes them into
+// its day file. It never blocks the probe cycle: should netcheck fall that
+// far behind, the cycle is dropped from the file (stdout has it).
+func persistProbes(nc *netcheck.Config, results []report.Result) {
+	if nc == nil || nc.Probes == nil {
+		return
+	}
+
+	select {
+	case nc.Probes <- results:
+	default:
+	}
 }
 
 // printOnce prints a QR label for the first cycle's own output and reports
