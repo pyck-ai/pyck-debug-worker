@@ -1,8 +1,6 @@
 module github.com/pyck-ai/pyck-debug-worker
 
-go 1.26.0
-
-toolchain go1.26.10
+go 1.27.3
 
 require (
 	github.com/cloudsoda/go-smb2 v0.0.0-20260803221621-0b399b9d036c
