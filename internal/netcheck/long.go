@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -199,8 +200,10 @@ func ping(ctx context.Context, cc *http2.ClientConn, results chan<- pingResult) 
 func ended(t Target, mode, phase string, started time.Time, conn *longConn, err error, agg *agg) event {
 	name := eventDrop
 
-	// Closing without our own Close or Shutdown means a GOAWAY arrived.
-	if st := conn.cc.State(); st.Closing && !errors.Is(err, errNoAnswer) {
+	// Closing without our own Close or Shutdown means a GOAWAY arrived. Since
+	// Go 1.27, x/net/http2 runs on net/http's HTTP/2, which also reports
+	// Closing for a connection that died, so a socket error or EOF stays a drop.
+	if st := conn.cc.State(); st.Closing && !errors.Is(err, errNoAnswer) && !connFailed(err) {
 		name = eventServerClosed
 		agg.serverClosed(t, mode)
 	} else {
@@ -222,6 +225,14 @@ func ended(t Target, mode, phase string, started time.Time, conn *longConn, err 
 	}
 
 	return ev
+}
+
+// connFailed reports whether err came from the connection itself (a reset, a
+// TLS alert, an EOF) rather than from HTTP/2 winding it down after a GOAWAY.
+func connFailed(err error) bool {
+	var opErr *net.OpError
+
+	return errors.As(err, &opErr) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 // dropClass is how a connection died: unanswered PINGs are a timeout.
