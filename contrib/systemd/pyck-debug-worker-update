@@ -1,16 +1,28 @@
 #!/usr/bin/env bash
-# Pull-based auto-updater for /usr/local/bin/pyck-debug-worker. Installs the
-# newest GitHub release with the same major version as the installed binary,
-# restarts the running pyck-debug-worker@ instances and rolls back if they do
-# not come up. Run by pyck-debug-worker-update.service/.timer.
+# Pull-based auto-updater for /usr/local/bin/pyck-debug-worker (README,
+# "Auto-update"). Run by pyck-debug-worker-update.service/.timer.
 #
-# Optional: GITHUB_TOKEN (read-only Contents on the repo) for a private repo.
+# Installs the newest GitHub release of the installed major version on
+# UPDATE_CHANNEL: test follows pre-releases (vX.Y.Z-rc.N), prod follows
+# releases (vX.Y.Z). Verifies it against checksums.txt and its --version,
+# stops the active units, swaps the binary (old one kept as <binary>.prev),
+# starts them again and rolls back if any is not active 10s later.
+#
+# Environment: UPDATE_CHANNEL (test or prod, set in the .service), GITHUB_TOKEN
+# (read-only Contents on the repo) if the repo is private.
 set -euo pipefail
 
 REPO=pyck-ai/pyck-debug-worker
-API=https://api.github.com/repos/$REPO
 BIN=/usr/local/bin/pyck-debug-worker
+# Release archive: ${ARCHIVE}_<version>_linux_<arch>.tar.gz, holding ${BIN##*/}.
+ARCHIVE=pyck-debug-worker
+# systemd units running $BIN.
+UNITS='pyck-debug-worker@*.service'
 LOCK=/run/lock/pyck-debug-worker-update.lock
+
+# --- Shared updater body, kept identical across pyck worker repos. ---
+
+API=https://api.github.com/repos/$REPO
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -27,11 +39,24 @@ github() {
   fi
 }
 
+# Prints the newest of the versions on stdin. A pre-release sorts before its
+# release (v1.0.0-rc.2 < v1.0.0): `-rc.` becomes `~rc.` for sort -V.
+newest() {
+  sed 's/-rc\./~rc./' | sort -V | tail -n1 | sed 's/~rc\./-rc./'
+}
+
 # Atomically replace $BIN with $1.
 install_bin() {
-  install -m0755 "$1" /usr/local/bin/.pyck-debug-worker.new
-  mv -f /usr/local/bin/.pyck-debug-worker.new "$BIN"
+  local tmp_bin=${BIN%/*}/.${BIN##*/}.new
+  install -m0755 "$1" "$tmp_bin"
+  mv -f "$tmp_bin" "$BIN"
 }
+
+case ${UPDATE_CHANNEL:-} in
+  test) prerelease=true suffix='-rc\.[0-9]+' ;;
+  prod) prerelease=false suffix='' ;;
+  *) die "UPDATE_CHANNEL must be test or prod, got '${UPDATE_CHANNEL:-}'" ;;
+esac
 
 exec 9>"$LOCK"
 if ! flock -n 9; then
@@ -40,17 +65,17 @@ if ! flock -n 9; then
 fi
 
 [[ -x $BIN ]] || die "$BIN not found"
-current=$("$BIN" --version)
+current=$("$BIN" --version 2>/dev/null) || die "$BIN does not support --version; install a release that does by hand"
 current=${current%% *}
-[[ $current =~ ^v([0-9]+)\.[0-9]+\.[0-9]+$ ]] || die "cannot parse installed version '$current'"
+[[ $current =~ ^v([0-9]+)\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]] || die "cannot parse installed version '$current'"
 major=${BASH_REMATCH[1]}
 
 releases=$(github "$API/releases?per_page=100")
-target=$(jq -r --arg re "^v${major}\\.[0-9]+\\.[0-9]+$" \
-  '.[] | select((.draft or .prerelease) | not) | .tag_name | select(test($re))' <<<"$releases" |
-  sort -V | tail -n1)
-if [[ -z $target || $(printf '%s\n' "$current" "$target" | sort -V | tail -n1) == "$current" ]]; then
-  log "up to date ($current)"
+target=$(jq -r --argjson pre "$prerelease" --arg re "^v${major}\\.[0-9]+\\.[0-9]+${suffix}\$" \
+  '.[] | select((.draft | not) and .prerelease == $pre) | .tag_name | select(test($re))' <<<"$releases" |
+  newest)
+if [[ -z $target || $(printf '%s\n' "$current" "$target" | newest) == "$current" ]]; then
+  log "up to date ($current, channel $UPDATE_CHANNEL)"
   exit 0
 fi
 
@@ -60,7 +85,7 @@ case $(uname -m) in
   *) die "unsupported architecture $(uname -m)" ;;
 esac
 
-tarball=pyck-debug-worker_${target#v}_linux_${arch}.tar.gz
+tarball=${ARCHIVE}_${target#v}_linux_${arch}.tar.gz
 asset_id() {
   jq -er --arg tag "$target" --arg name "$1" \
     '.[] | select(.tag_name == $tag) | .assets[] | select(.name == $name) | .id' <<<"$releases" ||
@@ -77,23 +102,23 @@ github "$API/releases/assets/$checksums_id" -H 'Accept: application/octet-stream
 
 grep -qE "^[0-9a-f]{64}  ${tarball//./\\.}\$" "$tmp/checksums.txt" || die "$tarball is not listed in checksums.txt"
 (cd "$tmp" && sha256sum -c --ignore-missing --quiet checksums.txt) || die "checksum mismatch for $tarball"
-tar -xzf "$tmp/$tarball" -C "$tmp" pyck-debug-worker
-new=$("$tmp/pyck-debug-worker" --version)
+tar -xzf "$tmp/$tarball" -C "$tmp" "${BIN##*/}"
+new=$("$tmp/${BIN##*/}" --version 2>/dev/null) || die "downloaded $target does not support --version"
 [[ ${new%% *} == "$target" ]] || die "downloaded binary reports '$new', expected $target"
 
 units=()
 while read -r unit _; do
   units+=("$unit")
-done < <(systemctl list-units --state=active --plain --no-legend 'pyck-debug-worker@*.service')
+done < <(systemctl list-units --state=active --plain --no-legend "$UNITS")
 
-log "updating $current -> $target, instances: ${units[*]:-none}"
+log "updating $current -> $target, units: ${units[*]:-none}"
 if ((${#units[@]})); then
   log "stopping ${units[*]}"
   systemctl stop "${units[@]}"
 fi
 cp -p "$BIN" "$BIN.prev"
-install_bin "$tmp/pyck-debug-worker"
-((${#units[@]})) || { log "updated to $target (no active instances)"; exit 0; }
+install_bin "$tmp/${BIN##*/}"
+((${#units[@]})) || { log "updated to $target (no active units)"; exit 0; }
 
 log "starting ${units[*]}"
 systemctl start "${units[@]}" || true

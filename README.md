@@ -413,13 +413,21 @@ empty `ExecStart=` line first).
 ### Auto-update
 
 [`contrib/systemd/pyck-debug-worker-update`](contrib/systemd/pyck-debug-worker-update)
-plus its `.service`/`.timer` check GitHub releases hourly. On a newer release it
+plus its `.service`/`.timer` check GitHub releases hourly. On a newer release on
+its channel (below) it
 downloads the linux tarball, verifies it against `checksums.txt` and its
 `--version`, **stops** the active `pyck-debug-worker@` instances, swaps the
 binary atomically (old one kept as `pyck-debug-worker.prev`), then starts them
 again. If any instance is not active 10s later, it restores the old binary and
 restarts it. It only follows the **installed major version**: a major upgrade is
 a manual install, and the timer then follows the new major.
+
+`Environment=UPDATE_CHANNEL=` in the `.service` picks what it follows, and is
+the only line that differs between servers: `test` takes pre-releases
+(`vX.Y.Z-rc.N`), `prod` (the shipped default) releases (`vX.Y.Z`). A pre-release
+sorts before its release, so `v1.6.0` replaces `v1.6.0-rc.3`. On a test server,
+change the line in `/etc/systemd/system/pyck-debug-worker-update.service` before
+enabling the timer.
 
 ```sh
 sudo install -D -m 0755 contrib/systemd/pyck-debug-worker-update /usr/local/libexec/pyck-debug-worker-update

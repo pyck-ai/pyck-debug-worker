@@ -1,7 +1,8 @@
 # Oneshot auto-updater for pyck-debug-worker, triggered by
-# pyck-debug-worker-update.timer. Installs the newest release of the installed
-# major version, restarts the active pyck-debug-worker@ instances and rolls
-# back if they do not come up. Install steps: see pyck-debug-worker@.service.
+# pyck-debug-worker-update.timer. Installs the newest release on
+# UPDATE_CHANNEL (below), restarts the active pyck-debug-worker@ instances and
+# rolls back if they do not come up. Install steps: see
+# pyck-debug-worker@.service.
 #
 # Logs:
 #   journalctl -u pyck-debug-worker-update
@@ -18,6 +19,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/libexec/pyck-debug-worker-update
+# test: follow pre-releases (vX.Y.Z-rc.N). prod: follow releases (vX.Y.Z).
+# The only line that differs between a test and a prod server.
+Environment=UPDATE_CHANNEL=prod
 
 # Optional GITHUB_TOKEN, only needed if the repo is private. Kept separate from
 # the worker's sysconfig so the token never reaches the worker.
