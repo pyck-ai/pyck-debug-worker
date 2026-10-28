@@ -2,8 +2,11 @@ package printcheck
 
 import (
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -45,8 +48,30 @@ func TestLoad(t *testing.T) {
 			Krb5Conf:  "/etc/pyck/krb5.conf",
 		}
 
-		if got != want {
+		if !reflect.DeepEqual(got, want) {
 			t.Errorf("Load() = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("realm and KDCs are read and the KDC list is trimmed", func(t *testing.T) {
+		got := Load(envMap(map[string]string{
+			EnvRealm: " CORP.EXAMPLE.COM ",
+			EnvKDCs:  " dc1.corp.example.com , dc2.corp.example.com:88 ",
+		}))
+
+		if got.Realm != "CORP.EXAMPLE.COM" {
+			t.Errorf("Realm = %q", got.Realm)
+		}
+
+		want := []string{"dc1.corp.example.com", "dc2.corp.example.com:88"}
+		if !reflect.DeepEqual(got.KDCs, want) {
+			t.Errorf("KDCs = %q, want %q", got.KDCs, want)
+		}
+	})
+
+	t.Run("no KDCs means a nil list", func(t *testing.T) {
+		if got := Load(envMap(nil)); got.KDCs != nil {
+			t.Errorf("KDCs = %q, want nil", got.KDCs)
 		}
 	})
 
@@ -146,6 +171,68 @@ func TestValidate(t *testing.T) {
 			contains: []string{EnvKeytab + " is unset"},
 		},
 		{
+			name: "explicit realm and KDCs",
+			mutate: func(c Config) Config {
+				c.Realm = "CORP.EXAMPLE.COM"
+				c.KDCs = []string{"dc1.corp.example.com", "dc2.corp.example.com:88"}
+
+				return c
+			},
+			wantOK: true,
+		},
+		{
+			name: "explicit realm with a bare principal",
+			mutate: func(c Config) Config {
+				c.Principal = "svc-probe"
+				c.Realm = "CORP.EXAMPLE.COM"
+				c.KDCs = []string{"dc1.corp.example.com"}
+
+				return c
+			},
+			wantOK: true,
+		},
+		{
+			name:     "realm without KDCs",
+			mutate:   func(c Config) Config { c.Realm = "CORP.EXAMPLE.COM"; return c },
+			contains: []string{EnvKDCs + " is unset"},
+		},
+		{
+			name:     "KDCs without realm",
+			mutate:   func(c Config) Config { c.KDCs = []string{"dc1.corp.example.com"}; return c },
+			contains: []string{EnvRealm + " is unset"},
+		},
+		{
+			name: "empty and malformed KDC entries",
+			mutate: func(c Config) Config {
+				c.Realm = "CORP.EXAMPLE.COM"
+				c.KDCs = []string{"dc1.corp.example.com", "", "dc2 dc3"}
+
+				return c
+			},
+			contains: []string{`invalid entry ""`, `invalid entry "dc2 dc3"`},
+		},
+		{
+			name: "malformed realm",
+			mutate: func(c Config) Config {
+				c.Principal = "svc-probe"
+				c.Realm = "CORP = {"
+				c.KDCs = []string{"dc1.corp.example.com"}
+
+				return c
+			},
+			contains: []string{"is not a realm name"},
+		},
+		{
+			name: "principal realm differs from the explicit realm",
+			mutate: func(c Config) Config {
+				c.Realm = "OTHER.EXAMPLE.COM"
+				c.KDCs = []string{"dc1.other.example.com"}
+
+				return c
+			},
+			contains: []string{"names realm CORP.EXAMPLE.COM but " + EnvRealm + "=OTHER.EXAMPLE.COM"},
+		},
+		{
 			// One failed start should tell the operator everything that is
 			// wrong, not one item per attempt.
 			name: "every fault is reported at once",
@@ -192,6 +279,47 @@ func TestValidate(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestKrb5SettingsFromRealmAndKDCs(t *testing.T) {
+	// krb5.conf points nowhere: with an explicit realm it must not be read.
+	cfg := Config{
+		Krb5Conf: filepath.Join(t.TempDir(), "absent.conf"),
+		Realm:    "CORP.EXAMPLE.COM",
+		KDCs:     []string{"dc1.corp.example.com", "dc2.corp.example.com:1088"},
+	}
+
+	settings, source, err := cfg.krb5Settings()
+	if err != nil {
+		t.Fatalf("krb5Settings() error = %v", err)
+	}
+
+	if want := EnvKDCs + "=dc1.corp.example.com,dc2.corp.example.com:1088"; source != want {
+		t.Errorf("source = %q, want %q", source, want)
+	}
+
+	if got := settings.LibDefaults.DefaultRealm; got != cfg.Realm {
+		t.Errorf("default_realm = %q, want %q", got, cfg.Realm)
+	}
+
+	if settings.LibDefaults.DNSLookupKDC {
+		t.Error("dns_lookup_kdc is on; only the named KDCs may be contacted")
+	}
+
+	_, kdcs, err := settings.GetKDCs(cfg.Realm, true)
+	if err != nil {
+		t.Fatalf("GetKDCs() error = %v", err)
+	}
+
+	got := slices.Sorted(maps.Values(kdcs))
+	if want := []string{"dc1.corp.example.com:88", "dc2.corp.example.com:1088"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("KDCs = %q, want %q", got, want)
+	}
+
+	// AES only: 18 is aes256-cts-hmac-sha1-96, 17 is aes128-cts-hmac-sha1-96.
+	if got, want := settings.LibDefaults.PermittedEnctypeIDs, []int32{18, 17}; !reflect.DeepEqual(got, want) {
+		t.Errorf("permitted enctypes = %v, want %v", got, want)
 	}
 }
 

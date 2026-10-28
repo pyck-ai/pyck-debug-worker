@@ -157,9 +157,30 @@ it.
 | `PYCK_KRB5_PRINCIPAL` | principal the keytab holds a key for, `user` or `user@REALM` |
 | `PYCK_KRB5_KEYTAB` | keytab path; defaults to `$CREDENTIALS_DIRECTORY/krb5-keytab` |
 | `KRB5_CONFIG` | defaults to `/etc/krb5.conf` |
+| `PYCK_KRB5_REALM` | realm to log in to; set together with `PYCK_KRB5_KDCS` |
+| `PYCK_KRB5_KDCS` | comma-separated KDCs (domain controllers), `host` or `host:port`; port defaults to 88 |
 
 The realm comes from the principal's `@REALM` suffix, or from `default_realm`
 in `krb5.conf` when the principal has none.
+
+### Realm and KDCs without krb5.conf
+
+When the host's `krb5.conf` does not know the realm the print server lives in,
+name it directly instead of editing the host:
+
+```ini
+Environment=PYCK_KRB5_REALM=CORP.EXAMPLE.COM
+Environment=PYCK_KRB5_KDCS=dc1.corp.example.com,dc2.corp.example.com
+```
+
+With both set, `KRB5_CONFIG` and `krb5.conf` are **not read at all**. The
+configuration is built in memory: that realm as `default_realm`, only the
+listed KDCs (no DNS lookup), and AES only. Setting one without the other, or a
+principal `@REALM` that differs from `PYCK_KRB5_REALM`, refuses to start. The
+service account and the print server must be in this one realm.
+
+Network path the host needs: `88/tcp` and `88/udp` to every listed KDC,
+`445/tcp` to the print server, and DNS for the print server's FQDN.
 
 Refuse RC4 in `krb5.conf`:
 

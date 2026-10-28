@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +42,10 @@ const (
 	EnvPrincipal = "PYCK_KRB5_PRINCIPAL"
 	EnvKeytab    = "PYCK_KRB5_KEYTAB"
 	EnvKrb5Conf  = "KRB5_CONFIG"
+	// EnvRealm and EnvKDCs name the realm and its KDCs directly. When both are
+	// set, krb5.conf is not read at all.
+	EnvRealm = "PYCK_KRB5_REALM"
+	EnvKDCs  = "PYCK_KRB5_KDCS"
 	// envCredentialsDirectory is set by systemd for units using
 	// LoadCredentialEncrypted=.
 	envCredentialsDirectory = "CREDENTIALS_DIRECTORY"
@@ -79,6 +84,11 @@ type Config struct {
 	Keytab string
 	// Krb5Conf is the path to krb5.conf.
 	Krb5Conf string
+	// Realm and KDCs, when set, replace krb5.conf with an in-memory
+	// configuration for exactly this realm. A KDC is host or host:port; the
+	// port defaults to 88.
+	Realm string
+	KDCs  []string
 }
 
 // Load reads the configuration from the environment. getenv is injected so the
@@ -90,6 +100,13 @@ func Load(getenv func(string) string) Config {
 		Principal: strings.TrimSpace(getenv(EnvPrincipal)),
 		Keytab:    strings.TrimSpace(getenv(EnvKeytab)),
 		Krb5Conf:  strings.TrimSpace(getenv(EnvKrb5Conf)),
+		Realm:     strings.TrimSpace(getenv(EnvRealm)),
+	}
+
+	if kdcs := strings.TrimSpace(getenv(EnvKDCs)); kdcs != "" {
+		for kdc := range strings.SplitSeq(kdcs, ",") {
+			cfg.KDCs = append(cfg.KDCs, strings.TrimSpace(kdc))
+		}
 	}
 
 	if cfg.Keytab == "" {
@@ -129,6 +146,7 @@ func (c Config) Validate() error {
 
 	faults = append(faults, c.principalFault()...)
 	faults = append(faults, c.keytabFault()...)
+	faults = append(faults, c.realmFault()...)
 
 	if len(faults) == 0 {
 		return nil
@@ -172,6 +190,85 @@ func (c Config) keytabFault() []string {
 	_ = file.Close()
 
 	return nil
+}
+
+// realmFault validates the explicit realm and KDCs. Both or neither: a realm
+// without KDCs, or KDCs without a realm, is a half-written configuration.
+func (c Config) realmFault() []string {
+	switch {
+	case c.Realm == "" && len(c.KDCs) == 0:
+		return nil
+	case c.Realm == "":
+		return []string{EnvKDCs + " is set but " + EnvRealm + " is unset"}
+	case len(c.KDCs) == 0:
+		return []string{EnvRealm + " is set but " + EnvKDCs + " is unset"}
+	}
+
+	var faults []string
+
+	if !isConfToken(c.Realm) {
+		faults = append(faults, EnvRealm+"="+strconv.Quote(c.Realm)+" is not a realm name")
+	}
+
+	for _, kdc := range c.KDCs {
+		if !isConfToken(kdc) {
+			faults = append(faults, EnvKDCs+" has an invalid entry "+strconv.Quote(kdc))
+		}
+	}
+
+	if realm := c.PrincipalRealm(); realm != "" && realm != c.Realm {
+		faults = append(faults, EnvPrincipal+"="+c.Principal+" names realm "+realm+
+			" but "+EnvRealm+"="+c.Realm)
+	}
+
+	return faults
+}
+
+// isConfToken reports whether s can be placed into a krb5.conf value as one
+// token: non-empty, with no whitespace and none of the syntax characters.
+func isConfToken(s string) bool {
+	return s != "" && !strings.ContainsAny(s, " \t\r\n{}=#;")
+}
+
+// krb5Settings returns the Kerberos configuration and where it came from:
+// built in memory from Realm and KDCs when set, read from Krb5Conf otherwise.
+func (c Config) krb5Settings() (*config.Config, string, error) {
+	if c.Realm == "" {
+		settings, err := config.Load(c.Krb5Conf)
+
+		return settings, c.Krb5Conf, err
+	}
+
+	settings, err := config.NewFromString(c.inlineKrb5Conf())
+
+	return settings, EnvKDCs + "=" + strings.Join(c.KDCs, ","), err
+}
+
+// inlineKrb5Conf renders the in-memory krb5.conf for Realm and KDCs. DNS
+// lookups are off so only the named KDCs are contacted, and only AES is
+// permitted, matching the RC4 refusal recommended for a file-based setup.
+func (c Config) inlineKrb5Conf() string {
+	const aes = "aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96"
+
+	var b strings.Builder
+
+	b.WriteString("[libdefaults]\n")
+	b.WriteString("  default_realm = " + c.Realm + "\n")
+	b.WriteString("  dns_lookup_kdc = false\n")
+	b.WriteString("  dns_lookup_realm = false\n")
+	b.WriteString("  default_tkt_enctypes = " + aes + "\n")
+	b.WriteString("  default_tgs_enctypes = " + aes + "\n")
+	b.WriteString("  permitted_enctypes = " + aes + "\n")
+	b.WriteString("[realms]\n")
+	b.WriteString("  " + c.Realm + " = {\n")
+
+	for _, kdc := range c.KDCs {
+		b.WriteString("    kdc = " + kdc + "\n")
+	}
+
+	b.WriteString("  }\n")
+
+	return b.String()
 }
 
 // User returns the principal's user part.
@@ -283,9 +380,9 @@ func loginStage(cfg Config) (*client.Client, report.Result) {
 			return false, "keytab " + cfg.Keytab + ": " + classify(err)
 		}
 
-		settings, err := config.Load(cfg.Krb5Conf)
+		settings, source, err := cfg.krb5Settings()
 		if err != nil {
-			return false, cfg.Krb5Conf + ": " + classify(err)
+			return false, source + ": " + classify(err)
 		}
 
 		realm := cfg.PrincipalRealm()
@@ -309,7 +406,7 @@ func loginStage(cfg Config) (*client.Client, report.Result) {
 
 		krbClient = candidate
 
-		return true, cfg.User() + "@" + realm + " logged in, " +
+		return true, cfg.User() + "@" + realm + " logged in via " + source + ", " +
 			fmt.Sprintf("%d keytab entries", len(table.Entries))
 	})
 
