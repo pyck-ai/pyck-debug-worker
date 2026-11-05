@@ -7,7 +7,7 @@ on:
 
 jobs:
   ci:
-    runs-on: self-hosted
+    runs-on: [pyck-ai, firecracker, standard]
     steps:
       - uses: actions/checkout@v4
 

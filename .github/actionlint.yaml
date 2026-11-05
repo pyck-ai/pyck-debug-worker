@@ -1,0 +1,2 @@
+self-hosted-runner:
+  labels: [pyck-ai, firecracker, light, standard, heavy, docker, buildkit, nvme, hicpu]
